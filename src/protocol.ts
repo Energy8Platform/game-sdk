@@ -1,0 +1,203 @@
+/**
+ * Casino Platform Game Bridge Protocol v2
+ *
+ * Defines all message types exchanged between the Host (casino shell)
+ * and the Guest (game iframe) via window.postMessage.
+ *
+ * The Host is responsible for all API interactions.
+ * The Guest (game) never has direct access to the backend or JWT tokens.
+ */
+
+// ─── Message Types ───────────────────────────────────────────────────
+
+/** Messages sent from Guest (game iframe) → Host (casino shell) */
+export type GuestMessageType =
+  | 'GAME_READY'
+  | 'PLAY_REQUEST'
+  | 'PLAY_RESULT_ACK'
+  | 'GET_BALANCE'
+  | 'GET_STATE'
+  | 'OPEN_DEPOSIT';
+
+/** Messages sent from Host (casino shell) → Guest (game iframe) */
+export type HostMessageType =
+  | 'INIT'
+  | 'PLAY_RESULT'
+  | 'PLAY_ERROR'
+  | 'BALANCE_UPDATE'
+  | 'STATE_RESPONSE'
+  | 'ERROR';
+
+export type BridgeMessageType = GuestMessageType | HostMessageType;
+
+// ─── Envelope ────────────────────────────────────────────────────────
+
+export interface BridgeMessage<T = unknown> {
+  /** Protocol identifier to filter unrelated postMessage events */
+  __casino_bridge: true;
+  /** Message type */
+  type: BridgeMessageType;
+  /** Message payload */
+  payload: T;
+  /** UUID for request‑response correlation */
+  id?: string;
+}
+
+// ─── Guest → Host Payloads ───────────────────────────────────────────
+
+export interface GameReadyPayload {}
+
+export interface GetBalancePayload {}
+
+export interface GetStatePayload {}
+
+export interface OpenDepositPayload {}
+
+export interface PlayResultAckPayload {
+  /** Round ID being acknowledged */
+  roundId: string;
+  /** Action that was executed */
+  action: string;
+  /** Total win amount from the result */
+  totalWin: number;
+  /** Player balance after the action */
+  balanceAfter: number;
+}
+
+// ─── Universal Play Request/Result ───────────────────────────────────
+
+export interface PlayRequestPayload {
+  /** Action to execute (e.g. "spin", "free_spin", "buy_bonus", "pick") */
+  action: string;
+  /** Bet amount */
+  bet: number;
+  /** Round ID for session-based actions */
+  roundId?: string;
+  /** Game-specific parameters */
+  params?: Record<string, unknown>;
+}
+
+export interface PlayResultPayload {
+  roundId: string;
+  action: string;
+  balanceAfter: number;
+  totalWin: number;
+  /** Game-specific output data (matrix, win_lines, multiplier, etc.) */
+  data: Record<string, unknown>;
+  /** Actions the client can invoke next */
+  nextActions: string[];
+  /** Session state, if a session is active */
+  session?: SessionData | null;
+  /** True if win credit was deferred (server-side retry) */
+  creditPending?: boolean;
+}
+
+export interface PlayErrorPayload {
+  code: string;
+  message: string;
+}
+
+// ─── Host → Guest Payloads ───────────────────────────────────────────
+
+export interface WinLineData {
+  paylineIndex: number;
+  symbolId: number;
+  count: number;
+  payout: number;
+}
+
+export interface AnywhereWinData {
+  symbolId: number;
+  count: number;
+  payout: number;
+  positions: [number, number][];
+}
+
+export interface InitPayload {
+  currency: string;
+  balance: number;
+  config: GameConfigData;
+  session?: SessionData | null;
+  /** Base URL for game assets in S3 (e.g. http://localhost:9000/bucket/games/{id}/bundle/) */
+  assetsUrl?: string;
+}
+
+export interface GameConfigData {
+  id: string;
+  type: string;
+  version?: string;
+  viewport?: { width: number; height: number };
+  betLevels?: number[];
+  symbols?: Record<string, SymbolData>;
+  paylines?: PaylineData[];
+  evaluationMode?: string;
+  [key: string]: unknown;
+}
+
+export interface SymbolData {
+  id: number;
+  isWild?: boolean;
+  isScatter?: boolean;
+  isMultiplier?: boolean;
+  multiplier?: number;
+}
+
+export interface PaylineData {
+  positions: number[];
+  payouts: Record<string, number>;
+}
+
+export interface BalanceUpdatePayload {
+  balance: number;
+}
+
+export interface SessionData {
+  roundId: string;
+  gameId: string;
+  /** Number of remaining session actions (e.g. free spins, picks) */
+  spinsRemaining: number;
+  /** Number of session actions already played */
+  spinsPlayed: number;
+  /** Cumulative session win */
+  totalWin: number;
+  /** Whether the session has been completed */
+  completed?: boolean;
+  /** Whether the max win cap was reached */
+  maxWinReached?: boolean;
+  /** Last bet amount */
+  betAmount?: number;
+  /** Session round history */
+  history?: Array<{ spinIndex: number; win: number; data: Record<string, unknown> }>;
+}
+
+export interface StateResponsePayload {
+  session: SessionData | null;
+}
+
+export interface ErrorPayload {
+  code: string;
+  message: string;
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────
+
+/** Type guard: is this event a Casino Bridge message? */
+export function isBridgeMessage(data: unknown): data is BridgeMessage {
+  return (
+    typeof data === 'object' &&
+    data !== null &&
+    '__casino_bridge' in data &&
+    (data as BridgeMessage).__casino_bridge === true &&
+    'type' in data &&
+    typeof (data as BridgeMessage).type === 'string'
+  );
+}
+
+/** Create a properly shaped bridge message */
+export function createMessage<T>(
+  type: BridgeMessageType,
+  payload: T,
+  id?: string,
+): BridgeMessage<T> {
+  return { __casino_bridge: true, type, payload, id };
+}
