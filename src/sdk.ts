@@ -25,6 +25,9 @@
  */
 
 import { PostMessageTransport } from './transport';
+import { MemoryTransport } from './memory-transport';
+import { MemoryChannel } from './memory-channel';
+import type { ITransport } from './transport-interface';
 import {
   InitPayload,
   PlayRequestPayload,
@@ -53,7 +56,7 @@ type EventMap = {
 type EventHandler<K extends keyof EventMap> = (data: EventMap[K]) => void;
 
 export class CasinoGameSDK {
-  private transport: PostMessageTransport;
+  private transport: ITransport;
   private initialized = false;
   private readonly debugMode: boolean;
 
@@ -66,11 +69,20 @@ export class CasinoGameSDK {
 
   constructor(options?: CasinoGameSDKOptions) {
     this.debugMode = options?.debug ?? false;
-    this.transport = new PostMessageTransport({
-      parentOrigin: options?.parentOrigin,
-      timeout: options?.timeout,
-      debug: options?.debug,
-    });
+
+    if (options?.devMode) {
+      const channel = MemoryChannel.getGlobal({ debug: options?.debug });
+      this.transport = new MemoryTransport(channel, {
+        timeout: options?.timeout,
+        debug: options?.debug,
+      });
+    } else {
+      this.transport = new PostMessageTransport({
+        parentOrigin: options?.parentOrigin,
+        timeout: options?.timeout,
+        debug: options?.debug,
+      });
+    }
 
     // Listen for unsolicited balance updates from the host
     this.transport.on<BalanceUpdatePayload>('BALANCE_UPDATE', (payload) => {
@@ -164,7 +176,7 @@ export class CasinoGameSDK {
         cleanup();
         this.log(`play() ✗ TIMEOUT action=${params.action}`);
         reject(new SDKError('TIMEOUT', 'No play response within timeout period'));
-      }, (this.transport as any).defaultTimeout ?? 15_000);
+      }, this.transport.defaultTimeout);
 
       const onResult = (payload: PlayResultPayload, msgId?: string) => {
         if (msgId !== id) return;
@@ -218,7 +230,7 @@ export class CasinoGameSDK {
    */
   playAck(result: PlayResultData, id?: string): void {
     if (this.transport.isDestroyed || !this.initialized) {
-      console.warn('[CasinoSDK] playAck called but SDK is not ready or has been destroyed');
+      console.warn('sdk [GUEST]: playAck called but SDK is not ready or has been destroyed');
       return;
     }
     this.log(`playAck() → roundId=${result.roundId} action=${result.action} totalWin=${result.totalWin}`);
@@ -333,7 +345,7 @@ export class CasinoGameSDK {
 
   private log(message: string): void {
     if (!this.debugMode) return;
-    console.debug(`%c[SDK]%c ${message}`, 'color: #16a34a; font-weight: bold', 'color: inherit');
+    console.debug(`%csdk [GUEST]%c ${message}`, 'color: #16a34a; font-weight: bold', 'color: inherit');
   }
 
   private assertReady(): void {
@@ -352,7 +364,7 @@ export class CasinoGameSDK {
         try {
           handler(data);
         } catch (err) {
-          console.error(`[CasinoSDK] Event handler error for "${event}":`, err);
+          console.error(`sdk [GUEST]: Event handler error for "${event}":`, err);
         }
       }
     }

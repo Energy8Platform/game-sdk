@@ -18,44 +18,82 @@ import {
   isBridgeMessage,
   createMessage,
 } from './protocol';
+import { MemoryChannel } from './memory-channel';
 
 // ─── Types ───────────────────────────────────────────────────────────
 
 export type MessageHandler<T = unknown> = (payload: T, id?: string) => void;
 
 export interface BridgeOptions {
-  /** The game iframe element to communicate with */
-  iframe: HTMLIFrameElement;
+  /**
+   * The game iframe element to communicate with.
+   * Required when devMode is not true.
+   */
+  iframe?: HTMLIFrameElement;
   /** Target origin for postMessage (default: `'*'`) */
   targetOrigin?: string;
   /**
    * Enable debug logging of all sent and received messages.
-   * Logs format: [HOST -> GUEST] / [GUEST -> HOST] MessageType payload
+   * Logs format: bridge [HOST][FROM HOST] / bridge [HOST][TO HOST] MessageType payload
    */
   debug?: boolean;
+  /**
+   * Enable dev mode for running without an iframe.
+   *
+   * When `true`, the Bridge uses an in-memory channel (`MemoryChannel`)
+   * instead of `window.postMessage`. The game SDK must also be created
+   * with `devMode: true` in the same page — they connect through
+   * `window.__casinoBridgeChannel`.
+   *
+   * @default false
+   */
+  devMode?: boolean;
 }
 
 // ─── Bridge Class ────────────────────────────────────────────────────
 
 export class Bridge {
-  private iframe: HTMLIFrameElement;
+  private iframe: HTMLIFrameElement | null;
   private targetOrigin: string;
   private handlers: Map<BridgeMessageType, MessageHandler[]>;
   private readonly debugMode: boolean;
+  private readonly devMode: boolean;
+  private readonly channel: MemoryChannel | null;
+  private readonly boundOnChannelMessage: ((msg: BridgeMessage) => void) | null;
 
   constructor(options: BridgeOptions) {
-    this.iframe = options.iframe;
-    this.targetOrigin = options.targetOrigin || '*';
-    this.handlers = new Map();
+    this.devMode = options.devMode ?? false;
     this.debugMode = options.debug ?? false;
+    this.handlers = new Map();
+    this.targetOrigin = options.targetOrigin || '*';
 
-    this.onMessage = this.onMessage.bind(this);
-    window.addEventListener('message', this.onMessage);
+    if (this.devMode) {
+      this.iframe = null;
+      this.channel = MemoryChannel.getGlobal({ debug: options.debug });
+      this.boundOnChannelMessage = (msg: BridgeMessage) => {
+        this.log('in', msg.type, msg.payload, msg.id);
+        this.dispatch(msg.type, msg.payload, msg.id);
+      };
+      this.channel.onHost(this.boundOnChannelMessage);
+    } else {
+      if (!options.iframe) {
+        throw new Error('Bridge: iframe option is required when devMode is not enabled');
+      }
+      this.iframe = options.iframe;
+      this.channel = null;
+      this.boundOnChannelMessage = null;
+      this.onMessage = this.onMessage.bind(this);
+      window.addEventListener('message', this.onMessage);
+    }
   }
 
   /** Remove all listeners and clean up */
   public destroy(): void {
-    window.removeEventListener('message', this.onMessage);
+    if (this.devMode && this.channel && this.boundOnChannelMessage) {
+      this.channel.offHost(this.boundOnChannelMessage);
+    } else {
+      window.removeEventListener('message', this.onMessage);
+    }
     this.handlers.clear();
   }
 
@@ -78,10 +116,16 @@ export class Bridge {
     }
   }
 
-  /** Send a message to the game iframe */
+  /** Send a message to the game iframe (or via memory channel in devMode) */
   public send<T = unknown>(type: BridgeMessageType, payload: T, id?: string): void {
-    if (!this.iframe.contentWindow) {
-      console.warn('Bridge: iframe contentWindow is null');
+    if (this.devMode && this.channel) {
+      this.log('out', type, payload, id);
+      this.channel.sendToGuest(type, payload, id);
+      return;
+    }
+
+    if (!this.iframe?.contentWindow) {
+      console.warn('bridge [HOST]: iframe contentWindow is null');
       return;
     }
     const message: BridgeMessage<T> = createMessage(type, payload, id);
@@ -105,8 +149,8 @@ export class Bridge {
 
   private log(direction: 'in' | 'out', type: BridgeMessageType, payload: unknown, id?: string): void {
     if (!this.debugMode) return;
-    const arrow = direction === 'out' ? '[HOST -> GUEST]' : '[GUEST -> HOST]';
+    const dir = direction === 'out' ? '[FROM HOST]' : '[TO HOST]';
     const idStr = id ? ` (id: ${id})` : '';
-    console.debug(`%c${arrow}%c ${type}${idStr}`, 'color: #0ea5e9; font-weight: bold', 'color: inherit', payload);
+    console.debug(`%cbridge [HOST]%c${dir} ${type}${idStr}`, 'color: #0ea5e9; font-weight: bold', 'color: inherit', payload);
   }
 }

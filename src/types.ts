@@ -93,4 +93,16 @@ export interface CasinoGameSDKOptions {
    * @default false
    */
   debug?: boolean;
+
+  /**
+   * Enable dev mode for running without an iframe.
+   *
+   * When `true`, the SDK uses an in-memory channel (`MemoryChannel`)
+   * instead of `window.postMessage`. The host-side `Bridge` must also
+   * be created with `devMode: true` in the same page — they connect
+   * through `window.__casinoBridgeChannel`.
+   *
+   * @default false
+   */
+  devMode?: boolean;
 }

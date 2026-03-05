@@ -1,38 +1,16 @@
 /**
- * PostMessage Transport Layer
+ * MemoryTransport — guest-side transport for devMode.
  *
- * Handles low-level communication between an iframe (Guest) and its parent (Host)
- * via window.postMessage. Provides request-response correlation with timeouts.
+ * Implements the same ITransport interface as PostMessageTransport,
+ * but communicates through a shared MemoryChannel instead of
+ * window.postMessage. This allows the game SDK to work without
+ * an iframe in development/sandbox environments.
  */
 
-import {
-  BridgeMessage,
-  BridgeMessageType,
-  GuestMessageType,
-  HostMessageType,
-  createMessage,
-  isBridgeMessage,
-} from './protocol';
-import { TimeoutError, BridgeDestroyedError } from './errors';
+import type { BridgeMessage, BridgeMessageType, GuestMessageType, HostMessageType } from './protocol';
 import type { ITransport, MessageHandler } from './transport-interface';
-
-export interface TransportOptions {
-  /**
-   * The expected origin of the parent window.
-   * Defaults to `document.referrer` origin. Set explicitly for stricter security.
-   * Use `'*'` only in development.
-   */
-  parentOrigin?: string;
-
-  /** Default timeout for request-response calls (ms). Default: 15000 */
-  timeout?: number;
-
-  /**
-   * Enable debug logging of all sent and received messages.
-   * Logs format: sdk [GUEST][FROM GUEST] / sdk [GUEST][TO GUEST] MessageType payload
-   */
-  debug?: boolean;
-}
+import { TimeoutError, BridgeDestroyedError } from './errors';
+import { MemoryChannel } from './memory-channel';
 
 interface PendingRequest {
   resolve: (payload: unknown) => void;
@@ -40,38 +18,41 @@ interface PendingRequest {
   timer: ReturnType<typeof setTimeout>;
 }
 
-export class PostMessageTransport implements ITransport {
-  private readonly parentOrigin: string;
-  public readonly defaultTimeout: number;
+export interface MemoryTransportOptions {
+  /** Default timeout for request-response calls (ms). Default: 15000 */
+  timeout?: number;
+  /** Enable debug logging */
+  debug?: boolean;
+}
+
+export class MemoryTransport implements ITransport {
+  private readonly channel: MemoryChannel;
   private readonly handlers = new Map<BridgeMessageType, MessageHandler[]>();
   private readonly pending = new Map<string, PendingRequest>();
   private destroyed = false;
   private readonly debugMode: boolean;
+  public readonly defaultTimeout: number;
 
-  constructor(options: TransportOptions = {}) {
-    this.parentOrigin = options.parentOrigin || this.resolveParentOrigin();
+  private readonly boundHandler: (msg: BridgeMessage) => void;
+
+  constructor(channel: MemoryChannel, options: MemoryTransportOptions = {}) {
+    this.channel = channel;
     this.defaultTimeout = options.timeout ?? 15_000;
     this.debugMode = options.debug ?? false;
 
-    this.handleMessage = this.handleMessage.bind(this);
-    window.addEventListener('message', this.handleMessage);
+    // Subscribe to messages coming FROM the host TO the guest
+    this.boundHandler = this.handleMessage.bind(this);
+    this.channel.onGuest(this.boundHandler);
   }
 
-  // ─── Public API ──────────────────────────────────────────────────
+  // ─── ITransport Implementation ─────────────────────────────────
 
-  /** Send a fire-and-forget message to the parent window */
   send<T>(type: GuestMessageType, payload: T, id?: string): void {
     this.assertNotDestroyed();
-    const msg = createMessage(type, payload, id);
     this.log('out', type, payload, id);
-    window.parent.postMessage(msg, this.parentOrigin);
+    this.channel.sendToHost(type, payload, id);
   }
 
-  /**
-   * Send a request and wait for a correlated response.
-   * Returns a Promise that resolves with the response payload,
-   * or rejects on timeout / error response.
-   */
   request<TReq, TRes>(
     requestType: GuestMessageType,
     responseType: HostMessageType,
@@ -99,7 +80,6 @@ export class PostMessageTransport implements ITransport {
     });
   }
 
-  /** Subscribe to incoming messages of a given type */
   on<T = unknown>(type: BridgeMessageType, handler: MessageHandler<T>): void {
     if (!this.handlers.has(type)) {
       this.handlers.set(type, []);
@@ -107,7 +87,6 @@ export class PostMessageTransport implements ITransport {
     this.handlers.get(type)!.push(handler as MessageHandler);
   }
 
-  /** Unsubscribe a previously subscribed handler */
   off<T = unknown>(type: BridgeMessageType, handler: MessageHandler<T>): void {
     const list = this.handlers.get(type);
     if (list) {
@@ -118,19 +97,17 @@ export class PostMessageTransport implements ITransport {
     }
   }
 
-  /** Tear down the transport. Rejects all pending requests. */
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;
 
-    window.removeEventListener('message', this.handleMessage);
+    this.channel.offGuest(this.boundHandler);
 
-    for (const [id, pending] of this.pending) {
+    for (const [, pending] of this.pending) {
       clearTimeout(pending.timer);
       pending.reject(new BridgeDestroyedError());
-      this.pending.delete(id);
     }
-
+    this.pending.clear();
     this.handlers.clear();
   }
 
@@ -138,19 +115,11 @@ export class PostMessageTransport implements ITransport {
     return this.destroyed;
   }
 
-  // ─── Private ─────────────────────────────────────────────────────
+  // ─── Private ───────────────────────────────────────────────────
 
-  private handleMessage(event: MessageEvent): void {
-    // Origin check
-    if (this.parentOrigin !== '*' && event.origin !== this.parentOrigin) {
-      return;
-    }
+  private handleMessage(msg: BridgeMessage): void {
+    if (this.destroyed) return;
 
-    if (!isBridgeMessage(event.data)) {
-      return;
-    }
-
-    const msg = event.data as BridgeMessage;
     this.log('in', msg.type, msg.payload, msg.id);
 
     // Check if this is a response to a pending request
@@ -159,7 +128,6 @@ export class PostMessageTransport implements ITransport {
       this.pending.delete(msg.id);
       clearTimeout(pending.timer);
       pending.resolve(msg.payload);
-      // Still notify handlers so they can observe all messages
     }
 
     // Dispatch to registered handlers
@@ -175,24 +143,10 @@ export class PostMessageTransport implements ITransport {
     }
   }
 
-  private resolveParentOrigin(): string {
-    try {
-      if (typeof document !== 'undefined' && document.referrer) {
-        const url = new URL(document.referrer);
-        return url.origin;
-      }
-    } catch {
-      // ignore
-    }
-    // Fallback: same origin
-    return typeof window !== 'undefined' ? window.location.origin : '*';
-  }
-
   private uuid(): string {
     if (typeof crypto !== 'undefined' && crypto.randomUUID) {
       return crypto.randomUUID();
     }
-    // Fallback for older environments
     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
       const r = (Math.random() * 16) | 0;
       const v = c === 'x' ? r : (r & 0x3) | 0x8;

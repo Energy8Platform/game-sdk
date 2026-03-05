@@ -57,6 +57,11 @@ export { SDKError, TimeoutError, BridgeNotReadyError, BridgeDestroyedError } fro
 
 // Transport (for advanced or testing use cases)
 export { PostMessageTransport, type TransportOptions } from './transport';
+export type { ITransport, MessageHandler as TransportMessageHandler } from './transport-interface';
+
+// Memory channel & transport (for devMode / testing)
+export { MemoryChannel } from './memory-channel';
+export { MemoryTransport, type MemoryTransportOptions } from './memory-transport';
 
 // Host-side bridge
 export { Bridge, type BridgeOptions, type MessageHandler } from './bridge';
