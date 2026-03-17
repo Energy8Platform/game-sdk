@@ -120,7 +120,7 @@ export class CasinoGameSDK {
 
     this.log(
       `ready() ✓ balance=${payload.balance} ${payload.currency}` +
-      (payload.session ? ` session=${payload.session.roundId} (${payload.session.spinsRemaining} remaining)` : ' no session'),
+      (payload.session ? ` session (${payload.session.spinsRemaining} remaining)` : ' no session'),
     );
 
     return {
@@ -195,7 +195,7 @@ export class CasinoGameSDK {
         this.log(
           `play() ✓ roundId=${payload.roundId} totalWin=${payload.totalWin} balanceAfter=${payload.balanceAfter}` +
           ` nextActions=[${payload.nextActions.join(', ')}]` +
-          (payload.session ? ` session=${payload.session.roundId} (${payload.session.spinsRemaining} remaining)` : '') +
+          (payload.session ? ` session (${payload.session.spinsRemaining} remaining)` : '') +
           (payload.session === null ? ' session=null' : '') +
           (payload.creditPending ? ' creditPending=true' : ''),
         );
@@ -263,9 +263,9 @@ export class CasinoGameSDK {
 
   /**
    * Query the host for the active game session (e.g. after page reload).
-   * Returns null if no session is active.
+   * Returns the last play result snapshot if a session is active, or null.
    */
-  async getState(): Promise<SessionData | null> {
+  async getState(): Promise<PlayResultData | null> {
     this.assertReady();
     this.log('getState()');
 
@@ -275,13 +275,19 @@ export class CasinoGameSDK {
       {},
     );
 
-    this._session = payload.session;
-    this.log(
-      payload.session
-        ? `getState() ✓ session=${payload.session.roundId} (${payload.session.spinsRemaining} remaining)`
-        : 'getState() ✓ no active session',
-    );
-    return payload.session;
+    if (payload.session) {
+      this._session = payload.session.session ?? null;
+      this._balance = payload.session.balanceAfter;
+      this.log(
+        `getState() ✓ roundId=${payload.session.roundId}` +
+        (payload.session.session ? ` session (${payload.session.session.spinsRemaining} remaining)` : ''),
+      );
+      return payload.session as PlayResultData;
+    }
+
+    this._session = null;
+    this.log('getState() ✓ no active session');
+    return null;
   }
 
   /**

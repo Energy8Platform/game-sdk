@@ -15,6 +15,7 @@ export type {
   SymbolData as SymbolInfo,
   PaylineData as PaylineInfo,
   SessionData as SessionState,
+  BonusFreeSpinData as BonusFreeSpin,
 } from './protocol';
 
 // ─── SDK Input Parameters ────────────────────────────────────────────
@@ -57,6 +58,10 @@ export interface PlayResultData {
   balanceAfter: number;
   /** Total win amount */
   totalWin: number;
+  /** Player currency */
+  currency: string;
+  /** Game identifier */
+  gameId: string;
   /** Game-specific output data (matrix, win_lines, multiplier, etc.) */
   data: Record<string, unknown>;
   /** Actions the client can invoke next */
@@ -65,6 +70,8 @@ export interface PlayResultData {
   session?: import('./protocol').SessionData | null;
   /** True if win credit was deferred (server-side retry) */
   creditPending?: boolean;
+  /** Bonus free spin grant info, if applicable */
+  bonusFreeSpin?: import('./protocol').BonusFreeSpinData | null;
 }
 
 export interface BalanceData {

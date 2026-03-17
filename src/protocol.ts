@@ -77,11 +77,20 @@ export interface PlayRequestPayload {
   params?: Record<string, unknown>;
 }
 
+export interface BonusFreeSpinData {
+  grantId: number;
+  remainingSpins: number;
+}
+
 export interface PlayResultPayload {
   roundId: string;
   action: string;
   balanceAfter: number;
   totalWin: number;
+  /** Player currency */
+  currency: string;
+  /** Game identifier */
+  gameId: string;
   /** Game-specific output data (matrix, win_lines, multiplier, etc.) */
   data: Record<string, unknown>;
   /** Actions the client can invoke next */
@@ -90,6 +99,8 @@ export interface PlayResultPayload {
   session?: SessionData | null;
   /** True if win credit was deferred (server-side retry) */
   creditPending?: boolean;
+  /** Bonus free spin grant info, if applicable */
+  bonusFreeSpin?: BonusFreeSpinData | null;
 }
 
 export interface PlayErrorPayload {
@@ -152,8 +163,6 @@ export interface BalanceUpdatePayload {
 }
 
 export interface SessionData {
-  roundId: string;
-  gameId: string;
   /** Number of remaining session actions (e.g. free spins, picks) */
   spinsRemaining: number;
   /** Number of session actions already played */
@@ -171,7 +180,7 @@ export interface SessionData {
 }
 
 export interface StateResponsePayload {
-  session: SessionData | null;
+  session: PlayResultPayload | null;
 }
 
 export interface ErrorPayload {

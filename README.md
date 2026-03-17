@@ -114,10 +114,13 @@ Execute any game action: spin, free spin, buy bonus, pick, etc. This is the **si
 | `action` | `string` | Action that was executed |
 | `balanceAfter` | `number` | Player balance after the action |
 | `totalWin` | `number` | Total win amount |
+| `currency` | `string` | Player currency |
+| `gameId` | `string` | Game identifier |
 | `data` | `Record<string, unknown>` | Game-specific output (matrix, win_lines, multiplier, etc.) |
 | `nextActions` | `string[]` | Actions the client can invoke next (e.g. `["free_spin"]`, `["spin"]`) |
 | `session` | `SessionData \| null` | Active session state, or `null` if no session / session completed |
 | `creditPending` | `boolean \| undefined` | `true` if win credit was deferred (server-side retry in progress) |
+| `bonusFreeSpin` | `BonusFreeSpin \| null \| undefined` | Bonus free spin grant info (`grantId`, `remainingSpins`), if applicable |
 
 **Errors:** `INSUFFICIENT_FUNDS`, `ACTIVE_SESSION_EXISTS`, `NO_ACTIVE_SESSION`, `SESSION_COMPLETED`, `TIMEOUT`
 
@@ -150,9 +153,9 @@ Fetch the current player balance from the host.
 
 ---
 
-### `sdk.getState(): Promise<SessionData | null>`
+### `sdk.getState(): Promise<PlayResultData | null>`
 
-Query the host for the active game session (e.g. after page reload). Returns `null` if no session is active.
+Query the host for the active game session (e.g. after page reload). Returns the last play result snapshot if a session is active, or `null` if no session exists. Also updates `sdk.session` and `sdk.balance` from the returned data.
 
 ---
 
@@ -202,13 +205,12 @@ Represents an active game session (free spins, bonus rounds, etc.):
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `roundId` | `string` | Session round ID |
-| `gameId` | `string` | Game identifier |
 | `spinsRemaining` | `number` | Remaining session actions |
 | `spinsPlayed` | `number` | Actions already played |
 | `totalWin` | `number` | Cumulative session win |
 | `completed` | `boolean` | Whether the session has finished |
 | `maxWinReached` | `boolean` | Whether the max win cap was hit |
+| `betAmount` | `number \| undefined` | Last bet amount |
 | `history` | `Array<{ spinIndex, win, data }>` | Round history within the session |
 
 ## Protocol Sub-export
@@ -267,7 +269,8 @@ bridge.on('GET_BALANCE', (_payload, id) => {
 });
 
 bridge.on('GET_STATE', (_payload, id) => {
-  bridge.send('STATE_RESPONSE', { session: getActiveSession() }, id);
+  // Return the last play result snapshot (with nested session), or null
+  bridge.send('STATE_RESPONSE', { session: getLastPlayResult() }, id);
 });
 
 bridge.on('OPEN_DEPOSIT', () => {
