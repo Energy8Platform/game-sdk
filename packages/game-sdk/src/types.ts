@@ -16,6 +16,7 @@ export type {
   PaylineData as PaylineInfo,
   SessionData as SessionState,
   BonusFreeSpinData as BonusFreeSpin,
+  JurisdictionFlagsData as JurisdictionFlags,
 } from './protocol';
 
 // ─── SDK Input Parameters ────────────────────────────────────────────
@@ -46,6 +47,10 @@ export interface InitData {
   session: import('./protocol').SessionData | null;
   /** Base URL for game assets in S3 */
   assetsUrl?: string;
+  /** ISO 639-1 language code passed by the operator. */
+  lang?: string;
+  /** Device hint passed by the operator. */
+  device?: 'desktop' | 'mobile';
 }
 
 /** Universal play result. */

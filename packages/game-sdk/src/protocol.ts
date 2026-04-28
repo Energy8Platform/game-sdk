@@ -131,6 +131,33 @@ export interface InitPayload {
   session?: SessionData | null;
   /** Base URL for game assets in S3 (e.g. http://localhost:9000/bucket/games/{id}/bundle/) */
   assetsUrl?: string;
+  /** ISO 639-1 language code passed by the operator (e.g. 'en', 'ru'). */
+  lang?: string;
+  /** Device hint passed by the operator. */
+  device?: 'desktop' | 'mobile';
+}
+
+/**
+ * Operator/jurisdiction-driven feature flags.
+ *
+ * Some operators (e.g. Stake) require games to honour these flags.
+ * On platforms that don't supply them the field is simply absent and
+ * games behave as if all features are allowed.
+ */
+export interface JurisdictionFlagsData {
+  socialCasino?: boolean;
+  disabledFullscreen?: boolean;
+  disabledTurbo?: boolean;
+  disabledSuperTurbo?: boolean;
+  disabledAutoplay?: boolean;
+  disabledSlamstop?: boolean;
+  disabledSpacebar?: boolean;
+  disabledBuyFeature?: boolean;
+  displayNetPosition?: boolean;
+  displayRTP?: boolean;
+  displaySessionTimer?: boolean;
+  /** Minimum round duration in ms; the game must not finalize a round faster than this. */
+  minimumRoundDuration?: number;
 }
 
 export interface GameConfigData {
@@ -142,6 +169,13 @@ export interface GameConfigData {
   symbols?: Record<string, SymbolData>;
   paylines?: PaylineData[];
   evaluationMode?: string;
+  /** Operator-supplied feature flags. Undefined on platforms that don't use jurisdictions. */
+  jurisdiction?: JurisdictionFlagsData;
+  /**
+   * Per-mode configuration (e.g. `{ BASE: {...}, BONUS: {...} }`).
+   * Shape is operator/game specific.
+   */
+  betModes?: Record<string, unknown>;
   [key: string]: unknown;
 }
 

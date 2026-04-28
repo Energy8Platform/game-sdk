@@ -1,0 +1,42 @@
+{
+  "name": "@energy8platform/stake-bridge",
+  "version": "0.1.0",
+  "description": "Drop-in host-side wrapper that lets a game built against @energy8platform/game-sdk run on Stake Engine",
+  "author": "Energy8 Platform",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/stake-bridge.umd.js",
+  "module": "dist/stake-bridge.esm.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/stake-bridge.esm.js",
+      "require": "./dist/stake-bridge.umd.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "rollup -c rollup.config.ts --configPlugin @rollup/plugin-typescript",
+    "dev": "rollup -c rollup.config.ts --configPlugin @rollup/plugin-typescript --watch",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run clean && npm run build"
+  },
+  "peerDependencies": {
+    "@energy8platform/game-sdk": "^2.7.1"
+  },
+  "dependencies": {
+    "@energy8platform/game-sdk": "^2.7.1"
+  },
+  "keywords": [
+    "casino",
+    "stake-engine",
+    "rgs",
+    "slot",
+    "bridge"
+  ]
+}

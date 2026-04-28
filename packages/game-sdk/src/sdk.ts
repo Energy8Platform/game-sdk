@@ -129,6 +129,8 @@ export class CasinoGameSDK {
       config: payload.config,
       session: payload.session ?? null,
       assetsUrl: payload.assetsUrl,
+      lang: payload.lang,
+      device: payload.device,
     };
   }
 

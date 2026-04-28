@@ -35,6 +35,8 @@ export {
   type SymbolData,
   type PaylineData,
   type SessionData,
+  type BonusFreeSpinData,
+  type JurisdictionFlagsData,
 } from './protocol';
 
 // Public types

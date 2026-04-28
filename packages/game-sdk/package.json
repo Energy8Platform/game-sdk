@@ -1,0 +1,41 @@
+{
+  "name": "@energy8platform/game-sdk",
+  "version": "2.7.1",
+  "description": "Energy8 Platform Game SDK — postMessage-based bridge for HTML5 game integration",
+  "author": "Energy8 Platform",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/casino-game-sdk.umd.js",
+  "module": "dist/casino-game-sdk.esm.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/casino-game-sdk.esm.js",
+      "require": "./dist/casino-game-sdk.umd.js",
+      "types": "./dist/index.d.ts"
+    },
+    "./protocol": {
+      "import": "./dist/protocol.js",
+      "types": "./dist/protocol.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "rollup -c rollup.config.ts --configPlugin @rollup/plugin-typescript",
+    "dev": "rollup -c rollup.config.ts --configPlugin @rollup/plugin-typescript --watch",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run clean && npm run build"
+  },
+  "keywords": [
+    "casino",
+    "game-sdk",
+    "iframe",
+    "postmessage",
+    "bridge",
+    "slot"
+  ]
+}
