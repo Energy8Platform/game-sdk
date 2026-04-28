@@ -35,9 +35,11 @@ import type {
   InitPayload,
   BalanceUpdatePayload,
   StateResponsePayload,
+  ConnectionStatePayload,
   GameConfigData,
   SessionData,
   JurisdictionFlagsData,
+  AutoplayPolicyData,
 } from '@energy8platform/game-sdk/protocol';
 import {
   RGSClient,
@@ -46,8 +48,11 @@ import {
   parseStakeUrl,
   type RGSAuthenticateResponse,
   type RGSPlayResponse,
+  type RGSReplayResponse,
 } from './rgs-client';
 import { loadAdapter, resolveAdapter } from './adapter-loader';
+import { lookupCurrency } from './currency';
+import { buildDisclaimer } from './disclaimer';
 import type {
   BookAdapter,
   BookSegment,
@@ -106,8 +111,16 @@ export class StakeBridge {
   private adapter: BookAdapter | null = null;
   private adapterLoad: Promise<BookAdapter>;
 
-  /** Resolves once Authenticate has completed (lazily kicked off in ctor). */
-  private authPromise: Promise<RGSAuthenticateResponse> | null = null;
+  /** Whether we were launched as a historical replay (`?replay=true&...`). */
+  private readonly isReplay: boolean;
+  /**
+   * Cached replay book — fetched from `/bet/replay/...` on the first
+   * play request and re-served on subsequent "Play Again" calls.
+   */
+  private replayBook: RGSReplayResponse | null = null;
+
+  /** Resolves once boot (live `Authenticate` or replay synthesis) has completed. */
+  private bootPromise: Promise<RGSAuthenticateResponse> | null = null;
   private authData: RGSAuthenticateResponse | null = null;
   private balance = 0;
   private currency = 'USD';
@@ -116,8 +129,6 @@ export class StakeBridge {
   private destroyed = false;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
 
-  /** Used to defer EndRound until the game ACKs the final segment. */
-  private pendingEndRound: ActiveRound | null = null;
   /** Map from PLAY_REQUEST id → segment index that was served. Used by ACK. */
   private servedByRequestId = new Map<string, { round: ActiveRound; index: number }>();
 
@@ -143,9 +154,11 @@ export class StakeBridge {
     });
 
     this.url = parseStakeUrl(options.url ?? window.location.href);
+    this.isReplay = !!this.url.replay;
     this.rgs = new RGSClient({
       url: this.url,
       protocol: options.protocol ?? 'https',
+      onConnectionState: (state) => this.emitConnectionState(state),
     });
 
     this.modeMap = options.modeMap ?? {};
@@ -158,8 +171,14 @@ export class StakeBridge {
     this.adapterLoad = this.bootstrapAdapter(options);
     this.subscribe();
 
-    // Kick off authentication eagerly so it's ready by the time GAME_READY arrives.
-    this.authPromise = this.authenticate();
+    // Kick off boot (Authenticate or replay setup) eagerly so it's ready
+    // by the time GAME_READY arrives.
+    this.bootPromise = this.boot();
+  }
+
+  private emitConnectionState(state: ConnectionStatePayload): void {
+    this.log(`connection ${state.status}${state.code ? ` (${state.code})` : ''}`);
+    this.bridge.send<ConnectionStatePayload>('CONNECTION_STATE', state);
   }
 
   // ─── Public API ──────────────────────────────────────────────────────
@@ -173,11 +192,11 @@ export class StakeBridge {
   }
 
   /**
-   * Promise that resolves once Authenticate + adapter load are both done.
-   * Useful for tests / advanced setups.
+   * Promise that resolves once boot (Authenticate or replay setup) and
+   * adapter load are both done. Useful for tests / advanced setups.
    */
   ready(): Promise<void> {
-    return Promise.all([this.authPromise, this.adapterLoad]).then(() => undefined);
+    return Promise.all([this.bootPromise, this.adapterLoad]).then(() => undefined);
   }
 
   // ─── Adapter bootstrap ───────────────────────────────────────────────
@@ -224,7 +243,50 @@ export class StakeBridge {
     });
   }
 
-  // ─── Authentication ──────────────────────────────────────────────────
+  // ─── Boot (Authenticate or replay setup) ─────────────────────────────
+
+  /**
+   * Branches on URL launch mode:
+   *  - **Wallet** (`?sessionID=...`): full `/wallet/authenticate` round-trip,
+   *    starts balance polling, may resume an in-flight round.
+   *  - **Replay** (`?replay=true&...`): no auth, no polling, synthetic
+   *    config built from URL parameters.
+   *
+   * Both branches resolve with an `RGSAuthenticateResponse`-shaped value
+   * so downstream code (validateBet, buildGameConfig) can be agnostic.
+   */
+  private async boot(): Promise<RGSAuthenticateResponse> {
+    if (this.isReplay) return this.bootReplay();
+    return this.authenticate();
+  }
+
+  private async bootReplay(): Promise<RGSAuthenticateResponse> {
+    const r = this.url.replay!;
+    this.balance = 0;
+    this.currency = r.currency;
+
+    // Synthesize an authData-shaped object so `buildGameConfig`, the
+    // validateBet code path, and any other consumer keep working.
+    const synth: RGSAuthenticateResponse = {
+      balance: { amount: 0, currency: r.currency },
+      round: null,
+      config: {
+        gameID: this.gameId || r.game,
+        minBet: r.amount,
+        maxBet: r.amount,
+        stepBet: r.amount,
+        defaultBetLevel: r.amount,
+        betLevels: [r.amount],
+        betModes: { [r.mode]: {} },
+        jurisdiction: undefined,
+      },
+    };
+    this.authData = synth;
+    this.log(
+      `replay boot: game=${r.game} version=${r.version} mode=${r.mode} event=${r.event} amount=${r.amount} currency=${r.currency}`,
+    );
+    return synth;
+  }
 
   private async authenticate(): Promise<RGSAuthenticateResponse> {
     const data = await this.rgs.authenticate();
@@ -272,7 +334,7 @@ export class StakeBridge {
 
   private async onGameReady(id?: string): Promise<void> {
     try {
-      const auth = await this.authPromise!;
+      const auth = await this.bootPromise!;
       await this.adapterLoad;
 
       const cfg = this.buildGameConfig(auth);
@@ -299,14 +361,28 @@ export class StakeBridge {
 
   private buildGameConfig(auth: RGSAuthenticateResponse): GameConfigData {
     const c = auth.config;
+    const jurisdiction = (c.jurisdiction ?? undefined) as
+      | JurisdictionFlagsData
+      | undefined;
+
+    const socialMode = !!this.url.social || !!jurisdiction?.socialCasino;
+    const demo = !!this.url.demo;
+
     const baseConfig: GameConfigData = {
       id: this.gameId || c.gameID || 'unknown',
       type: 'slot',
       betLevels: c.betLevels.map(fromMinor),
       betModes: c.betModes,
-      jurisdiction: (c.jurisdiction ?? undefined) as
-        | JurisdictionFlagsData
-        | undefined,
+      jurisdiction,
+      currency: lookupCurrency(this.currency),
+      autoplay: this.deriveAutoplayPolicy(jurisdiction),
+      replayMode: this.isReplay,
+      socialMode,
+      demo,
+      disclaimerLines: buildDisclaimer({
+        socialMode,
+        replayMode: this.isReplay,
+      }),
       // Stake-specific extras surfaced via index signature
       stake: {
         minBet: fromMinor(c.minBet),
@@ -326,6 +402,25 @@ export class StakeBridge {
     return baseConfig;
   }
 
+  /**
+   * Derive autoplay recommendations from jurisdiction flags.
+   *
+   * Returns `undefined` when the jurisdiction disables autoplay
+   * outright. Otherwise advertises a sensible baseline (`maxCount`
+   * = 100, mandatory feature-trigger stop) — the game is free to
+   * narrow these further but should not exceed them.
+   */
+  private deriveAutoplayPolicy(
+    j: JurisdictionFlagsData | undefined,
+  ): AutoplayPolicyData | undefined {
+    if (this.isReplay) return undefined;
+    if (j?.disabledAutoplay) return undefined;
+    return {
+      maxCount: 100,
+      requiredStops: ['feature-trigger'],
+    };
+  }
+
   private synthesizeSessionForResume(): SessionData | null {
     if (!this.active) return null;
     return this.synthSession(this.active);
@@ -338,7 +433,7 @@ export class StakeBridge {
     id?: string,
   ): Promise<void> {
     try {
-      await this.authPromise;
+      await this.bootPromise;
       await this.adapterLoad;
 
       // Continuation of an in-flight round?
@@ -382,6 +477,11 @@ export class StakeBridge {
     payload: PlayRequestPayload,
     requestId?: string,
   ): Promise<void> {
+    if (this.isReplay) {
+      await this.startReplayRound(payload, requestId);
+      return;
+    }
+
     const auth = this.authData!;
     const mode = this.actionToMode(payload.action);
     const betAmount = payload.bet;
@@ -425,6 +525,71 @@ export class StakeBridge {
       endRoundCalled: false,
       lastDelivered: null,
       rawBook: playResp.round.state,
+    };
+
+    await this.deliverSegment(0, requestId);
+  }
+
+  /**
+   * Replay equivalent of `startNewRound`. Fetches the book once via
+   * `/bet/replay/{game}/{version}/{mode}/{event}`, caches it, and
+   * re-streams it on every subsequent "Play Again" — no `/wallet/play`,
+   * no `/wallet/end-round`, no `/bet/event`.
+   */
+  private async startReplayRound(
+    payload: PlayRequestPayload,
+    requestId?: string,
+  ): Promise<void> {
+    const r = this.url.replay!;
+
+    if (!this.replayBook) {
+      this.replayBook = await this.rgs.replay({
+        game: r.game,
+        version: r.version,
+        mode: r.mode,
+        event: r.event,
+      });
+    }
+
+    // The replay endpoint may return the book directly, or wrap it in
+    // `state` (matching the `/wallet/play` round shape). Accept both.
+    const bookData =
+      (this.replayBook as { state?: unknown }).state ?? this.replayBook;
+    const payoutMultiplier =
+      (this.replayBook as { payoutMultiplier?: number }).payoutMultiplier ?? 0;
+    const costMultiplier =
+      (this.replayBook as { costMultiplier?: number }).costMultiplier ?? 1;
+
+    const ctx: RoundContext = {
+      mode: r.mode,
+      triggerAction: payload.action,
+      betAmount: fromMinor(r.amount),
+      payoutMultiplier,
+      currency: r.currency,
+      roundId: r.event,
+    };
+
+    const segments = this.adapter!.splitRound(bookData, ctx);
+    if (!segments.length) {
+      throw new Error('Adapter returned an empty segment list (replay)');
+    }
+
+    this.active = {
+      roundId: ctx.roundId,
+      betID: 0,
+      mode: r.mode,
+      triggerAction: payload.action,
+      betAmount: fromMinor(r.amount),
+      payoutMultiplier,
+      costMultiplier,
+      // Replay rounds never need EndRound — they're not real bets.
+      rgsActive: false,
+      segments,
+      cursor: 0,
+      totalWin: 0,
+      endRoundCalled: false,
+      lastDelivered: null,
+      rawBook: bookData,
     };
 
     await this.deliverSegment(0, requestId);
@@ -551,6 +716,8 @@ export class StakeBridge {
     const segment = round.segments[round.cursor];
     const marker = segment?.progressMarker ?? `seg-${round.cursor}`;
     round.lastEventMarker = marker;
+    // Replay rounds aren't tracked by RGS — skip /bet/event.
+    if (this.isReplay) return;
     // Fire-and-forget. /bet/event failures don't disrupt gameplay.
     this.rgs.event(marker).catch((err) => this.log(`event() failed: ${err}`));
   }
@@ -567,6 +734,15 @@ export class StakeBridge {
   // ─── GET_BALANCE ─────────────────────────────────────────────────────
 
   private async onGetBalance(id?: string): Promise<void> {
+    if (this.isReplay) {
+      // No wallet to read — return the synthetic 0 balance.
+      this.bridge.send<BalanceUpdatePayload>(
+        'BALANCE_UPDATE',
+        { balance: this.balance },
+        id,
+      );
+      return;
+    }
     try {
       const { balance } = await this.rgs.balance();
       this.balance = fromMinor(balance.amount);
@@ -675,6 +851,7 @@ export class StakeBridge {
   }
 
   private startBalancePolling(): void {
+    if (this.isReplay) return;
     this.stopBalancePolling();
     if (this.balancePollMs <= 0) return;
     this.pollTimer = setInterval(() => {

@@ -37,6 +37,9 @@ export {
   type SessionData,
   type BonusFreeSpinData,
   type JurisdictionFlagsData,
+  type ConnectionStatePayload,
+  type CurrencyMetaData,
+  type AutoplayPolicyData,
 } from './protocol';
 
 // Public types

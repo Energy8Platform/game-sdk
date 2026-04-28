@@ -26,6 +26,7 @@ export type HostMessageType =
   | 'PLAY_ERROR'
   | 'BALANCE_UPDATE'
   | 'STATE_RESPONSE'
+  | 'CONNECTION_STATE'
   | 'ERROR';
 
 export type BridgeMessageType = GuestMessageType | HostMessageType;
@@ -176,6 +177,42 @@ export interface GameConfigData {
    * Shape is operator/game specific.
    */
   betModes?: Record<string, unknown>;
+  /**
+   * Currency metadata for display (symbol, decimals, placement).
+   * Set by hosts that know the player's currency at INIT time.
+   */
+  currency?: CurrencyMetaData;
+  /**
+   * Autoplay rules the operator wants the game UI to honour. Bridge
+   * advertises these as recommendations; hard enforcement is up to
+   * the game.
+   */
+  autoplay?: AutoplayPolicyData;
+  /**
+   * `true` when the game is being launched as a historical-round
+   * replay (no wallet, no end-round). The game should hide the
+   * balance / bet selector / autoplay / buy-bonus UI and surface
+   * a "Play / Play Again" CTA only.
+   */
+  replayMode?: boolean;
+  /**
+   * `true` when the operator marks the session as social-casino
+   * (sweepstakes etc.). Games are expected to swap loss/win/wager
+   * vocabulary using the helper exposed by the host.
+   */
+  socialMode?: boolean;
+  /**
+   * `true` when the launch is a demo / free-play session. No real
+   * balance is affected. Games typically render a "DEMO" banner and
+   * may default to a fixed demo balance.
+   */
+  demo?: boolean;
+  /**
+   * Operator-required disclaimer lines (malfunction-void, RGS
+   * source-of-truth etc.). The game is expected to render these
+   * verbatim in its info / paytable screen.
+   */
+  disclaimerLines?: string[];
   [key: string]: unknown;
 }
 
@@ -194,6 +231,52 @@ export interface PaylineData {
 
 export interface BalanceUpdatePayload {
   balance: number;
+}
+
+/**
+ * Pushed by the host whenever the connection state to its backend
+ * changes (e.g. fetch retries on the RGS hit, network goes away,
+ * round can't be finalized). Games typically render an overlay on
+ * `lost` and dismiss it on `restored`.
+ */
+export interface ConnectionStatePayload {
+  status: 'lost' | 'restored' | 'connecting';
+  /** Optional error code from the underlying transport / RGS. */
+  code?: string;
+  /** Optional human-readable hint. */
+  message?: string;
+}
+
+/** Currency metadata derived from the operator's currency code. */
+export interface CurrencyMetaData {
+  /** ISO 4217 code (e.g. 'USD'). */
+  code: string;
+  /** Default decimal places for display (e.g. 2 for USD, 0 for JPY). */
+  decimals: number;
+  /** Display symbol (e.g. '$', '€', 'kr'). */
+  symbol: string;
+  /** Whether the symbol comes after the amount (e.g. `10 zł`). */
+  symbolAfter?: boolean;
+}
+
+/**
+ * Operator-driven autoplay constraints (Stake jurisdictions).
+ *
+ * The host advertises *recommendations* — games render UI to honour
+ * them. Hard enforcement (e.g. rejecting plays past `maxCount`) is
+ * the game's responsibility; the host won't refuse a play purely
+ * because autoplay rules were ignored.
+ */
+export interface AutoplayPolicyData {
+  /** Maximum spins per autoplay run, if the jurisdiction caps it. */
+  maxCount?: number;
+  /**
+   * Stops the autoplay UI must surface to the player. Common values:
+   *   - `'loss-limit'` — stop at user-defined cumulative loss
+   *   - `'single-win-limit'` — stop on a single win above N
+   *   - `'feature-trigger'` — stop on free spins / bonus trigger
+   */
+  requiredStops?: Array<'loss-limit' | 'single-win-limit' | 'feature-trigger' | string>;
 }
 
 export interface SessionData {

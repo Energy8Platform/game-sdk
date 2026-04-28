@@ -1,6 +1,6 @@
 {
   "name": "@energy8platform/stake-bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Drop-in host-side wrapper that lets a game built against @energy8platform/game-sdk run on Stake Engine",
   "author": "Energy8 Platform",
   "license": "MIT",
@@ -27,10 +27,10 @@
     "prepublishOnly": "npm run clean && npm run build"
   },
   "peerDependencies": {
-    "@energy8platform/game-sdk": "^2.7.1"
+    "@energy8platform/game-sdk": "^2.7.2"
   },
   "dependencies": {
-    "@energy8platform/game-sdk": "^2.7.1"
+    "@energy8platform/game-sdk": "^2.7.2"
   },
   "keywords": [
     "casino",

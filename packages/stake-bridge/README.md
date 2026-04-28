@@ -33,14 +33,18 @@ The game's runtime code is identical regardless of platform — it always talks 
 
 | `StakeBridge` (this package) | `BookAdapter` (per game) |
 |---|---|
-| URL parsing (`sessionID`, `rgs_url`, `lang`, `device`) | `splitRound(book, ctx) → BookSegment[]` |
+| URL parsing (live: `sessionID`/`rgs_url`/`lang`/`device`; **replay**: `replay`/`game`/`version`/`mode`/`event`/`amount`/`currency`) | `splitRound(book, ctx) → BookSegment[]` |
 | Authenticate / Play / EndRound / Event / Balance calls | `resumeFrom(book, lastEvent, ctx)` *(optional)* |
-| Money conversion (decimal ↔ minor units × 1 000 000) | `enrichConfig(config)` *(optional)* |
+| **Replay**: GET `/bet/replay/{game}/{version}/{mode}/{event}` + book caching for "Play Again" | `enrichConfig(config)` *(optional)* |
+| Money conversion (decimal ↔ minor units × 1 000 000) | |
 | Segment cursor + `creditPending` lifecycle | |
 | Bet validation against authenticate config | |
-| Idle balance polling | |
+| Idle balance polling (skipped in replay) | |
 | Auto `/wallet/end-round` before final segment of non-zero-payout rounds | |
 | Mid-round recovery via `/bet/event` markers | |
+| Retry with exponential backoff on idempotent endpoints (`authenticate`, `balance`, `end-round`, `event`, `replay`) — **never** on `/wallet/play` | |
+| `connection:lost` / `:restored` events propagated through SDK | |
+| Currency metadata (`config.currency`), social-mode flag, autoplay recommendations, disclaimer lines, jurisdiction flags surfaced via `INIT.config` | |
 
 The adapter is the **only** game-specific piece.
 
@@ -158,6 +162,114 @@ import type {
   AdapterModule, AdapterFactoryOptions, ModeMap,
 } from '@energy8platform/stake-bridge';
 ```
+
+## Replay mode
+
+Stake launches a historical round via a different URL pattern:
+
+```
+?replay=true&game=...&version=...&mode=...&event=...&rgs_url=...&currency=...&amount=...
+```
+
+`StakeBridge` auto-detects this and switches modes — same `new StakeBridge(...)` call covers both paths:
+
+```ts
+const params = new URLSearchParams(location.search);
+const isStakeOrReplay =
+  (params.has('sessionID') && params.has('rgs_url')) ||
+  params.has('replay');
+
+if (isStakeOrReplay) {
+  const [{ StakeBridge }, { default: adapter }] = await Promise.all([
+    import('@energy8platform/stake-bridge'),
+    import('./stake-adapter'),
+  ]);
+  new StakeBridge({ devMode: true, adapter, modeMap, gameId, debug });
+}
+```
+
+In replay mode the bridge:
+
+- skips `/wallet/authenticate` (synthetic config: `balance = 0`, `currency` and `betLevels = [amount]` from URL)
+- on the first `play()` calls `GET /bet/replay/{game}/{version}/{mode}/{event}` and **caches the book** — every subsequent "Play Again" replays the same book without another network round-trip
+- runs the cached book through your `BookAdapter.splitRound` exactly like a live round, so the game animates identically
+- never calls `/wallet/end-round`, `/bet/event`, or balance polling
+- sets `INIT.config.replayMode = true` so the game can hide the balance, bet selector, autoplay and buy-bonus controls and surface a "Play / Play Again" CTA only
+
+The game's only replay-specific code is reading `config.replayMode` and adjusting its UI.
+
+## Connection state events
+
+Idempotent RGS calls (`authenticate`, `balance`, `end-round`, `event`, `replay`) auto-retry on network errors and 5xx with exponential backoff (default: 3 attempts, 200/600/1800 ms ±25% jitter). When the first attempt fails the bridge emits `'lost'`; when a retry succeeds it emits `'restored'`. Games subscribe via the SDK:
+
+```ts
+sdk.on('connectionStateChanged', ({ status, code }) => {
+  if (status === 'lost') showReconnectOverlay(code);
+  if (status === 'restored') hideReconnectOverlay();
+});
+```
+
+> ⚠️ **`/wallet/play` is never retried.** It is *not* idempotent — a timed-out request may have been processed server-side, so a blind retry could double-bill the player. On a play timeout the bridge surfaces an `RGSError` to the game; the recommended recovery is to wait for `'restored'`, then re-call `Authenticate` to discover whether the round actually started, and use `getState()` to resume.
+
+## Currency, social, autoplay, disclaimer
+
+These all flow through `INIT.config` so the game reads them once at boot. None of them are required — fields are simply absent on platforms that don't supply them.
+
+| Field | Source | Notes |
+|---|---|---|
+| `config.currency` | `Authenticate.balance.currency` looked up against the bridge's currency table | Includes `code`, `symbol`, `decimals`, `symbolAfter`. Use `formatAmount(value, meta)` for display. |
+| `config.autoplay` | Derived from `jurisdiction.disabledAutoplay` | `undefined` when autoplay is disabled or in replay mode; otherwise `{ maxCount, requiredStops }`. Recommendations only — no hard enforcement. |
+| `config.socialMode` | URL `?social=true` ∨ `jurisdiction.socialCasino` | Game must wrap user-visible text via `applySocialReplacements(...)` exported from this package. |
+| `config.replayMode` | URL `?replay=true` | Tell the UI to render replay layout. |
+| `config.disclaimerLines` | `buildDisclaimer(...)` from this package | Canonical Stake template (6 lines, current calendar year on the copyright). |
+| `config.demo` | URL `?demo=true` | Free-play / demo session. |
+| `config.jurisdiction` | `Authenticate.config.jurisdiction` | Raw flags (`disabledTurbo`, `displayRTP`, `minimumRoundDuration`, …). |
+
+```ts
+import { formatAmount } from '@energy8platform/stake-bridge';
+
+const { config } = await sdk.ready();
+display.textContent = formatAmount(123.45, config.currency!);
+// → '$123.45' for USD, '€123,45' for EUR (locale-dependent)
+```
+
+### Disclaimer
+
+`config.disclaimerLines` is filled by default with [Stake's official template](https://stake-engine.com/docs/approval/disclaimer) — six sentences plus a copyright line — so games don't need to ship their own copy.
+
+```ts
+const { config } = await sdk.ready();
+infoScreen.append(...config.disclaimerLines!.map((line) => p(line)));
+// →  Malfunction voids all wins and plays.
+//    A consistent internet connection is required. In the event of …
+//    The expected return is calculated over many plays.
+//    The game display is not representative of any physical device …
+//    Winnings are settled according to the amount received from the …
+//    TM and © 2026 Stake Engine.
+```
+
+To override (e.g. localised wording or extra clauses), pass your own to `buildDisclaimer({ override })` before constructing the bridge, or replace the lines in `enrichConfig`. The seven approval points are documented in `src/disclaimer.ts`.
+
+### Social mode
+
+`@energy8platform/stake-bridge` ships [Stake's full social-mode dictionary](https://stake-engine.com/docs/reference/social-mode) — 36 canonical replacements (`bet`→`play`, `bonus buy`→`bonus / feature`, …). When `config.socialMode === true`, run user-visible strings through `applySocialReplacements`:
+
+```ts
+import { applySocialReplacements } from '@energy8platform/stake-bridge';
+
+const { config } = await sdk.ready();
+const wrap = config.socialMode ? applySocialReplacements : (s: string) => s;
+
+button.textContent = wrap('Place your bets');
+// social=true → 'Come and play / join in the game'
+// social=false → 'Place your bets'
+```
+
+The helper sorts rules by length descending automatically, so `'bonus buy'` resolves before `'buy'` and `'pays out'` before `'pays'`. Casing is preserved (`BET → PLAY`, `Bet → Play`).
+
+### Demo mode
+
+`config.demo === true` when the URL carries `?demo=true`. Real balance is not affected. Games typically render a "DEMO" banner and may use a pre-set demo balance.
 
 ## Stake's RGS — at a glance
 

@@ -37,12 +37,53 @@ export interface StakeRound<TBook = unknown> {
   amount?: number;
 }
 
-/** Stake URL parameters parsed from the iframe / host page location. */
+/** Replay-mode URL parameters. Present only when the page was launched as a replay. */
+export interface StakeReplayParams {
+  /** Game identifier (UUID). Required by Stake. */
+  game: string;
+  /** Math version (e.g. `'1'`, `'2'`). Required by Stake. */
+  version: string;
+  /** Bet mode used in the original round. Required by Stake. */
+  mode: string;
+  /** Event/simulation ID to replay. Required by Stake. */
+  event: string;
+  /**
+   * ISO 4217 currency code from the URL. Optional per the spec — the
+   * bridge falls back to `'USD'` if the URL doesn't include one.
+   */
+  currency: string;
+  /**
+   * Original bet amount in minor units (× API_MULTIPLIER). Optional
+   * per the spec — the bridge falls back to `0` when omitted.
+   */
+  amount: number;
+}
+
+/**
+ * Stake URL parameters parsed from the iframe / host page location.
+ *
+ * Either `sessionID` (live wallet session) or `replay` (historical
+ * replay) is set, never both. The bridge picks its operating mode
+ * based on which one is present.
+ */
 export interface StakeUrlParams {
-  sessionID: string;
   rgsUrl: string;
   lang: string;
   device: 'desktop' | 'mobile';
+  /** Live wallet session id. Present unless `replay` is. */
+  sessionID?: string;
+  /** Replay context. Present when the page was launched as a replay. */
+  replay?: StakeReplayParams;
+  /** Operator marked the session as social-casino (e.g. via `?social=true`). */
+  social?: boolean;
+  /** Demo / free-play launch (`?demo=true`). No real balance is affected. */
+  demo?: boolean;
+  /**
+   * Display currency from the URL (`?currency=USD`). Wallet sessions
+   * trust `Authenticate.balance.currency` over this; replay launches
+   * fall back to it when no in-band currency is available.
+   */
+  currency?: string;
 }
 
 // ─── Adapter contract ────────────────────────────────────────────────

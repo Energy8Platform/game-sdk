@@ -36,6 +36,7 @@ import {
   PlayErrorPayload,
   BalanceUpdatePayload,
   StateResponsePayload,
+  ConnectionStatePayload,
   GameConfigData,
   SessionData,
 } from './protocol';
@@ -51,6 +52,7 @@ import type {
 type EventMap = {
   balanceUpdate: BalanceData;
   error: SDKError;
+  connectionStateChanged: ConnectionStatePayload;
 };
 
 type EventHandler<K extends keyof EventMap> = (data: EventMap[K]) => void;
@@ -88,6 +90,12 @@ export class CasinoGameSDK {
     this.transport.on<BalanceUpdatePayload>('BALANCE_UPDATE', (payload) => {
       this._balance = payload.balance;
       this.emit('balanceUpdate', { balance: payload.balance });
+    });
+
+    // Listen for connection state changes pushed by the host
+    this.transport.on<ConnectionStatePayload>('CONNECTION_STATE', (payload) => {
+      this.log(`connectionStateChanged: ${payload.status}${payload.code ? ` (${payload.code})` : ''}`);
+      this.emit('connectionStateChanged', payload);
     });
 
     // Listen for generic errors pushed by the host
@@ -309,6 +317,9 @@ export class CasinoGameSDK {
    * Available events:
    * - `balanceUpdate` — emitted when the player balance changes
    * - `error` — emitted on unexpected errors pushed by the host
+   * - `connectionStateChanged` — emitted when the host's link to its
+   *   backend changes state (`'lost'` / `'connecting'` / `'restored'`).
+   *   Render a reconnect overlay on `'lost'` and dismiss on `'restored'`.
    */
   on<K extends keyof EventMap>(event: K, handler: EventHandler<K>): void {
     if (!this.eventHandlers[event]) {

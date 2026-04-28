@@ -5,14 +5,15 @@
  * `CasinoGameSDK` run on Stake Engine without changes.
  *
  * ```ts
- * import { StakeBridge } from '@energy8platform/game-sdk/stake';
+ * import { StakeBridge } from '@energy8platform/stake-bridge';
+ * import adapter from './stake-adapter';
  *
  * const bridge = new StakeBridge({
- *   iframe: document.getElementById('game') as HTMLIFrameElement,
+ *   devMode: true,
+ *   adapter,
  *   modeMap: { spin: 'BASE', buy_bonus: 'BONUS' },
  *   gameId: 'sweet-bonanza',
  *   debug: true,
- *   // adapter loaded by convention from `<assetsUrl>/stake-adapter.js`
  * });
  * ```
  */
@@ -27,15 +28,33 @@ export {
   type RGSPlayResponse,
   type RGSEndRoundResponse,
   type RGSEventResponse,
+  type RGSReplayResponse,
+  type RGSReplayParams,
   type RGSBalance,
   type RGSPlayParams,
   type RGSClientOptions,
+  type RetryPolicy,
 } from './rgs-client';
 export {
   defaultAdapterUrl,
   loadAdapter,
   resolveAdapter,
 } from './adapter-loader';
+export {
+  CURRENCY_META,
+  lookupCurrency,
+  formatAmount,
+  type FormatAmountOptions,
+} from './currency';
+export {
+  SOCIAL_REPLACEMENTS,
+  applySocialReplacements,
+  type SocialReplacementRule,
+} from './social';
+export {
+  DEFAULT_DISCLAIMER_LINES,
+  buildDisclaimer,
+} from './disclaimer';
 export type {
   StakeBridgeOptions,
   BookAdapter,
@@ -43,6 +62,7 @@ export type {
   RoundContext,
   StakeRound,
   StakeUrlParams,
+  StakeReplayParams,
   ModeMap,
   AdapterModule,
   AdapterFactoryOptions,

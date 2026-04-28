@@ -1,6 +1,6 @@
 {
   "name": "@energy8platform/game-sdk",
-  "version": "2.7.1",
+  "version": "2.7.2",
   "description": "Energy8 Platform Game SDK — postMessage-based bridge for HTML5 game integration",
   "author": "Energy8 Platform",
   "license": "MIT",
