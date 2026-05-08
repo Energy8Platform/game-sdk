@@ -1,0 +1,9 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`weightedReservoirSample (A-Res) > produces stable output for a given seed (snapshot) 1`] = `
+[
+  2,
+  3,
+  8,
+]
+`;
