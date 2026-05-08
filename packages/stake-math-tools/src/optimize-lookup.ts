@@ -8,7 +8,7 @@ import type {
 } from './types.js';
 import { computeMetrics, isNearMax } from './metrics.js';
 import { bucketize } from './bucketize.js';
-import { mulberry32, computeQuotas, stratifiedSample, weightedReservoirSample } from './sample.js';
+import { mulberry32, computeQuotas, stratifiedSample } from './sample.js';
 import { solveNNLS } from './nnls.js';
 import { quantizeWeights } from './quantize.js';
 
@@ -81,52 +81,11 @@ export function optimizeLookupTable(
       minPerBucket,
       requireMaxReached,
     });
-    let sampledIdx = stratifiedSample(buckets, filtered, quotas, rng);
-
-    // Stratified sampling can come up short when buckets overlap (the near-max
-    // bucket overlaps with the top log bucket). Top up with weighted-reservoir
-    // sampling over the unsampled remainder so we always reach nRowsOut.
-    if (sampledIdx.length < params.nRowsOut) {
-      const chosen = new Set(sampledIdx);
-      const remIdx: number[] = [];
-      const remW: number[] = [];
-      for (let i = 0; i < filtered.length; i++) {
-        if (!chosen.has(i)) {
-          remIdx.push(i);
-          remW.push(filtered[i].weight);
-        }
-      }
-      const need = params.nRowsOut - sampledIdx.length;
-      const extras = weightedReservoirSample(remIdx, remW, need, rng);
-      sampledIdx = sampledIdx.concat(extras);
-    } else if (sampledIdx.length > params.nRowsOut) {
-      // computeQuotas can oversubscribe when many non-empty log buckets each
-      // claim minPerBucket slots beyond the nRowsOut budget. Trim deterministically:
-      // keep the highest-weight candidates, breaking ties on sim, then on index.
-      // We must preserve any near-max-bucket samples to honor requireMaxReached.
-      const nearMaxSet = new Set(buckets.nearMaxBucket.indices);
-      const mustKeep: number[] = [];
-      const trimmable: number[] = [];
-      for (const i of sampledIdx) {
-        if (requireMaxReached && nearMaxSet.has(i) && mustKeep.length < params.nRowsOut) {
-          mustKeep.push(i);
-        } else {
-          trimmable.push(i);
-        }
-      }
-      const need = params.nRowsOut - mustKeep.length;
-      trimmable.sort((a, b) => {
-        const wd = filtered[b].weight - filtered[a].weight;
-        if (wd !== 0) return wd;
-        const sd = filtered[a].sim - filtered[b].sim;
-        if (sd !== 0) return sd;
-        return a - b;
-      });
-      sampledIdx = mustKeep.concat(trimmable.slice(0, Math.max(0, need)));
-    }
+    const sampledIdx = stratifiedSample(buckets, filtered, quotas, rng);
 
     if (sampledIdx.length !== params.nRowsOut) {
-      // Quota arithmetic failed (very rare — input too sparse); retry with relaxed minPerBucket
+      // Should not happen with fixed sample.ts (computeQuotas + stratifiedSample
+      // honor their invariants); kept as defense in depth.
       minPerBucket = Math.max(1, minPerBucket - 1);
       continue;
     }

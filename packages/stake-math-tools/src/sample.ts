@@ -104,14 +104,29 @@ export interface Quotas {
  */
 export function computeQuotas(buckets: QuotaInput, params: QuotaParams): Quotas {
   const { nRowsOut, minPerBucket, requireMaxReached } = params;
+
+  // Count non-empty log buckets — these are the ones eligible for minPerBucket.
+  const nonEmptyLogCount = buckets.logBuckets.reduce(
+    (s, b) => s + (b.indices.length > 0 ? 1 : 0),
+    0,
+  );
+  const wantNearMax = requireMaxReached && buckets.nearMaxBucket.indices.length > 0;
+
+  // Compute an effective minPerBucket so the floor allocation does not exceed nRowsOut.
+  // Floor at 0; near-max keeps its 1 slot when room allows, dropped only as a last resort.
+  let effectiveMinPerBucket = minPerBucket;
+  while (
+    effectiveMinPerBucket > 0 &&
+    nonEmptyLogCount * effectiveMinPerBucket + (wantNearMax ? 1 : 0) > nRowsOut
+  ) {
+    effectiveMinPerBucket--;
+  }
+  let nearMaxQuota = wantNearMax && nonEmptyLogCount * effectiveMinPerBucket < nRowsOut ? 1 : 0;
+
   const logQuotas = buckets.logBuckets.map((b) => {
     if (b.indices.length === 0) return 0;
-    return Math.min(minPerBucket, b.indices.length);
+    return Math.min(effectiveMinPerBucket, b.indices.length);
   });
-  let nearMaxQuota = 0;
-  if (requireMaxReached && buckets.nearMaxBucket.indices.length > 0) {
-    nearMaxQuota = 1;
-  }
 
   let assigned = logQuotas.reduce((s, q) => s + q, 0) + nearMaxQuota;
   let remaining = nRowsOut - assigned;
@@ -152,7 +167,7 @@ export function computeQuotas(buckets: QuotaInput, params: QuotaParams): Quotas 
     remaining = nRowsOut - assigned;
   }
 
-  const zeroQuota = Math.min(remaining, buckets.zeroBucket.indices.length);
+  const zeroQuota = Math.max(0, Math.min(remaining, buckets.zeroBucket.indices.length));
   // If zero bucket can't soak it all up, dump the rest into the largest log bucket
   let leftover = remaining - zeroQuota;
   if (leftover > 0) {
@@ -165,6 +180,21 @@ export function computeQuotas(buckets: QuotaInput, params: QuotaParams): Quotas 
       logQuotas[i] += give;
       leftover -= give;
     }
+  }
+
+  // Defensive invariant: quotas must sum to exactly nRowsOut, unless the
+  // total available indices across all buckets are fewer than nRowsOut (in
+  // which case the cap at total available is the best achievable).
+  const totalAvailable =
+    buckets.zeroBucket.indices.length +
+    buckets.logBuckets.reduce((s, b) => s + b.indices.length, 0) +
+    buckets.nearMaxBucket.indices.length;
+  const expected = Math.min(nRowsOut, totalAvailable);
+  const total = zeroQuota + logQuotas.reduce((s, q) => s + q, 0) + nearMaxQuota;
+  if (total !== expected) {
+    throw new Error(
+      `computeQuotas invariant violated: total=${total}, expected=${expected} (nRowsOut=${nRowsOut}, totalAvailable=${totalAvailable})`,
+    );
   }
 
   return { zeroBucket: zeroQuota, logBuckets: logQuotas, nearMaxBucket: nearMaxQuota };
@@ -184,6 +214,8 @@ export function stratifiedSample(
   rng: () => number,
 ): number[] {
   const chosen = new Set<number>();
+  const totalQuota =
+    quotas.zeroBucket + quotas.logBuckets.reduce((s, q) => s + q, 0) + quotas.nearMaxBucket;
 
   // 1. Near-max first (these indices may overlap log buckets)
   if (quotas.nearMaxBucket > 0 && buckets.nearMaxBucket.indices.length > 0) {
@@ -218,5 +250,29 @@ export function stratifiedSample(
     }
   }
 
-  return [...chosen];
+  // 4. Top up any shortfall caused by overlapping buckets (e.g. near-max
+  //    consumes indices a log bucket also wanted). Sample the remainder of
+  //    `rows` (anything not already chosen) by weight.
+  if (chosen.size < totalQuota) {
+    const remIdx: number[] = [];
+    const remW: number[] = [];
+    for (let i = 0; i < rows.length; i++) {
+      if (!chosen.has(i)) {
+        remIdx.push(i);
+        remW.push(rows[i].weight);
+      }
+    }
+    const need = totalQuota - chosen.size;
+    for (const idx of weightedReservoirSample(remIdx, remW, need, rng)) {
+      chosen.add(idx);
+    }
+  }
+
+  const out = [...chosen];
+  if (out.length !== totalQuota) {
+    throw new Error(
+      `stratifiedSample invariant violated: produced ${out.length}, expected ${totalQuota}`,
+    );
+  }
+  return out;
 }

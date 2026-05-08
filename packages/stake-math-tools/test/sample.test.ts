@@ -77,3 +77,47 @@ describe('computeQuotas', () => {
     expect(quotas.zeroBucket).toBeLessThanOrEqual(1);
   });
 });
+
+describe('computeQuotas (over-allocation guard)', () => {
+  it('caps total quota at nRowsOut even when min allocation would overshoot', () => {
+    // 10 non-empty log buckets, minPerBucket=3, nRowsOut=20 → 30 > 20
+    const log: Bucket[] = Array.from({ length: 10 }, (_, i) => ({
+      indices: [i * 10, i * 10 + 1, i * 10 + 2],
+      totalWeight: 3,
+      weightedPayoutSum: 100 * (i + 1),
+    }));
+    const zero: Bucket = { indices: [], totalWeight: 0, weightedPayoutSum: 0 };
+    const nearMax: Bucket = { indices: [], totalWeight: 0, weightedPayoutSum: 0 };
+    const quotas = computeQuotas(
+      { zeroBucket: zero, logBuckets: log, nearMaxBucket: nearMax },
+      { nRowsOut: 20, minPerBucket: 3, requireMaxReached: false },
+    );
+    const total = quotas.zeroBucket + quotas.logBuckets.reduce((a, b) => a + b, 0) + quotas.nearMaxBucket;
+    expect(total).toBe(20);
+    expect(quotas.zeroBucket).toBeGreaterThanOrEqual(0);
+    for (const q of quotas.logBuckets) expect(q).toBeGreaterThanOrEqual(0);
+  });
+});
+
+describe('stratifiedSample (overlap top-up)', () => {
+  it('delivers exactly the total quota even when near-max overlaps log buckets', () => {
+    // Top log bucket overlaps near-max bucket; near-max consumes enough that the
+    // log bucket cannot fulfil its quota from its own indices alone.
+    const rows = Array.from({ length: 20 }, () => ({ weight: 1 }));
+    const zero: Bucket = { indices: [0, 1, 2, 3, 4, 5], totalWeight: 6, weightedPayoutSum: 0 };
+    const log: Bucket[] = [
+      { indices: [10, 11, 12, 13, 14], totalWeight: 5, weightedPayoutSum: 1000 },
+    ];
+    const nearMax: Bucket = { indices: [10, 11, 12, 13, 14], totalWeight: 5, weightedPayoutSum: 1000 };
+    // Near-max takes 3, log wants 3 — only 2 will be available after overlap → shortfall of 1.
+    const quotas = { zeroBucket: 3, logBuckets: [3], nearMaxBucket: 3 }; // total 9
+    const rng = mulberry32(1);
+    const sampled = stratifiedSample(
+      { zeroBucket: zero, logBuckets: log, nearMaxBucket: nearMax },
+      rows,
+      quotas,
+      rng,
+    );
+    expect(sampled.length).toBe(9);
+  });
+});
