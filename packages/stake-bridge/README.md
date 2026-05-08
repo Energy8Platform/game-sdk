@@ -285,6 +285,13 @@ Five POST endpoints, all driven by the URL parameters Stake passes to the iframe
 
 Money is in integer minor units × `1_000_000`. The bridge handles all conversion.
 
+## Building a lookup table (force matrix)
+
+For Stake Engine deployments that require a pre-built lookup table, use the
+companion package [`@energy8platform/stake-math-tools`](../stake-math-tools)
+to compress raw simulation output into a target-RTP / target-volatility
+weighted table. It is a node-only dev-time tool, not bundled into the game.
+
 ## License
 
 MIT

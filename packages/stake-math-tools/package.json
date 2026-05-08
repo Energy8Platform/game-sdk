@@ -1,0 +1,22 @@
+{
+  "name": "@energy8platform/stake-math-tools",
+  "version": "0.1.0",
+  "description": "Node-only dev-time math utilities for the Energy8 Stake bridge: lookup-table (force matrix) builder",
+  "author": "Energy8 Platform",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "vitest": "^1.6.0"
+  }
+}
