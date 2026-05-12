@@ -47,6 +47,13 @@ export interface OptimizeParams {
    *  Default 0.05 (5%). Set to 1.0 to disable.
    */
   maxRowRtpShare?: number;
+
+  /** Maximum integer weight allowed for any single output row, as a multiple of the
+   *  uniform prior weight (totalWeightOut / nRowsOut). E.g., 10 means no row can have
+   *  weight greater than 10 × (totalWeightOut / nRowsOut). This prevents Stake's ETL
+   *  ("Within Liability Limits") check from failing due to over-concentrated weight.
+   *  Default 10. Set to Infinity to disable. */
+  maxWeightPerRow?: number;
 }
 
 export interface OptimizeAchieved {
@@ -64,6 +71,8 @@ export interface ToleranceMet {
   maxReached: boolean;
   /** True if no output row contributes more than maxRowRtpShare of total RTP. */
   rtpConcentration: boolean;
+  /** True if no output row's weight exceeds maxWeightPerRow × (totalWeightOut / nRowsOut). */
+  weightCap: boolean;
 }
 
 export interface TopKShare {
@@ -100,6 +109,8 @@ export interface OptimizeResult {
   toleranceMet: ToleranceMet;
   /** The single output row's largest fraction of total RTP. */
   maxRowRtpShare: number;
+  /** Maximum integer weight observed in output, as a multiple of uniform prior. */
+  maxWeightRatio: number;
   warnings: string[];
   stakeReport: StakeReport;
 }

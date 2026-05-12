@@ -195,6 +195,7 @@ describe('integration', () => {
       nRowsOut: 10_000,
       requireMaxReached: true,
       maxRowRtpShare: 0.05,
+      maxWeightPerRow: Infinity,  // isolate RTP-share cap from weight cap
       maxIterations: 2,
     });
 
@@ -300,6 +301,58 @@ describe('integration', () => {
     });
     expect(r2.stakeReport.payoutMultMax).toBeCloseTo(r2.achieved.maxPayout / 200, 6);
     expect(r2.stakeReport.baseStd).toBeCloseTo(r1.stakeReport.baseStd / 2, 5);
+  });
+
+  it('12. caps single-row weight to maxWeightPerRow × prior', () => {
+    const rng = makeRng(12);
+    const rows: LookupRow[] = new Array(100_000);
+    for (let i = 0; i < 100_000; i++) {
+      const u = rng();
+      let p = 0;
+      if (u > 0.7) p = Math.floor(rng() * 200);
+      if (u > 0.97) p = Math.floor(rng() * 50_000);
+      if (u > 0.9995) p = Math.floor(rng() * 1_000_000);
+      rows[i] = { sim: i, weight: 1 + Math.floor(rng() * 100), payoutCents: p };
+    }
+
+    const result = optimizeLookupTable(rows, {
+      targetRTP: 0.96, toleranceRTP: 0.01,
+      targetCV: 5.0, toleranceCV: 2.0,
+      targetHitRate: 0.20, toleranceHitRate: 0.05,
+      capMaxWin: 1_000_000,
+      nRowsOut: 1000,
+      requireMaxReached: false,
+      maxWeightPerRow: 10,           // cap at 10× prior
+      maxIterations: 2,
+    });
+
+    const uniformPrior = (1000 * 1_000_000) / 1000; // = 1_000_000
+    const maxAllowedWeight = 10 * uniformPrior;
+    for (const r of result.rows) {
+      expect(r.weight).toBeLessThanOrEqual(maxAllowedWeight + 1);
+    }
+    expect(result.maxWeightRatio).toBeLessThanOrEqual(10 + 1e-6);
+    expect(result.toleranceMet.weightCap).toBe(true);
+  });
+
+  it('13. maxWeightPerRow=Infinity disables the cap (preserves old behavior)', () => {
+    const rng = makeRng(13);
+    const rows: LookupRow[] = new Array(50_000);
+    for (let i = 0; i < 50_000; i++) {
+      rows[i] = { sim: i, weight: 1, payoutCents: rng() > 0.7 ? Math.floor(rng() * 5000) : 0 };
+    }
+    const result = optimizeLookupTable(rows, {
+      targetRTP: 0.5, toleranceRTP: 0.5,
+      targetCV: 3, toleranceCV: 100,
+      targetHitRate: 0.3, toleranceHitRate: 0.5,
+      capMaxWin: 5000,
+      nRowsOut: 1000,
+      requireMaxReached: false,
+      maxWeightPerRow: Infinity,
+      maxIterations: 1,
+    });
+    // No weight-cap warning when disabled
+    expect(result.warnings.find(w => w.includes('maxWeightPerRow'))).toBeUndefined();
   });
 
   it('6. handles nRowsOut=5000 without n² memory blowup', () => {
