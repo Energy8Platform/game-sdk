@@ -38,4 +38,28 @@ describe('quantizeWeights', () => {
     const out = quantizeWeights([1.5, 2.5, 3.5], 8);
     expect(out).toEqual([2, 3, 3]);
   });
+
+  it('handles large n with many floor-1 rows efficiently (regression: was O(K·n log n))', () => {
+    // Synthesize a scenario that previously took 30+ seconds:
+    // ~99% of rows have continuous weight near 0 (will clamp to floor 1)
+    // ~1% of rows have large weight
+    const n = 100_000;
+    const T = n * 1_000_000;
+    const weights = new Array(n);
+    for (let i = 0; i < n; i++) {
+      // 99% small, 1% large
+      weights[i] = i % 100 === 0 ? T / 1000 : 0.0001;
+    }
+    const t0 = performance.now();
+    const out = quantizeWeights(weights, T);
+    const elapsed = performance.now() - t0;
+    expect(elapsed).toBeLessThan(1000); // 1 second — was 30+s before fix
+    expect(out.length).toBe(n);
+    let sum = 0;
+    for (const v of out) {
+      sum += v;
+      expect(v).toBeGreaterThanOrEqual(1);
+    }
+    expect(sum).toBe(T);
+  });
 });

@@ -33,26 +33,32 @@ export function quantizeWeights(weights: ReadonlyArray<number>, total: number): 
       Math.round(Math.max(0, w - floors[i]) * 1e10) / 1e10,
     );
     const order = indicesSortedByDesc(remainders);
-    for (let k = 0; k < deficit; k++) floors[order[k]]++;
+    // Distribute deficit across rows. If deficit > n, give each row floor(deficit/n)
+    // plus one extra to the top (deficit % n) rows.
+    const bulk = Math.floor(deficit / n);
+    if (bulk > 0) for (let i = 0; i < n; i++) floors[i] += bulk;
+    const remainder = deficit - bulk * n;
+    for (let k = 0; k < remainder; k++) floors[order[k]]++;
   } else if (deficit < 0) {
     // Remove 1's from rows with the largest current weight, never going below 1.
+    // Single sort + single greedy pass: from the largest-floor row downward,
+    // take as much as possible (capped by floors[i] − 1) until toRemove == 0.
+    // O(n log n) total — previously O(K · n log n) when many rows are clamped at 1.
     let toRemove = -deficit;
-    while (toRemove > 0) {
-      const order = indicesSortedByDesc(floors);
-      let progress = false;
-      for (const i of order) {
-        if (toRemove === 0) break;
-        if (floors[i] > 1) {
-          floors[i]--;
-          toRemove--;
-          progress = true;
-        }
+    const order = indicesSortedByDesc(floors);
+    for (const i of order) {
+      if (toRemove === 0) break;
+      const removable = floors[i] - 1;
+      if (removable > 0) {
+        const take = Math.min(removable, toRemove);
+        floors[i] -= take;
+        toRemove -= take;
       }
-      if (!progress) {
-        // Shouldn't happen: total >= n was checked; sumFloors was at most total + (max(1, .) bias),
-        // and that bias is ≤ n which can always be reclaimed.
-        throw new Error('quantizeWeights: cannot reduce further while keeping w_i >= 1');
-      }
+    }
+    if (toRemove > 0) {
+      // Shouldn't happen: total >= n was checked; sumFloors was at most total + (max(1, .) bias),
+      // and that bias is ≤ n which can always be reclaimed.
+      throw new Error('quantizeWeights: cannot reduce further while keeping w_i >= 1');
     }
   }
 
