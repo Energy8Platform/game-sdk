@@ -175,6 +175,53 @@ describe('integration', () => {
     expect(zeroRowFraction).toBeLessThan(0.85);
   });
 
+  it('8. caps single-row RTP contribution to maxRowRtpShare', () => {
+    const rng = makeRng(8);
+    const rows: LookupRow[] = new Array(200_000);
+    for (let i = 0; i < 200_000; i++) {
+      const u = rng();
+      let p = 0;
+      if (u > 0.7) p = Math.floor(rng() * 200);
+      if (u > 0.97) p = Math.floor(rng() * 50_000);
+      if (u > 0.9995) p = Math.floor(rng() * 5_000_000);
+      rows[i] = { sim: i, weight: 1 + Math.floor(rng() * 100), payoutCents: p };
+    }
+
+    const result = optimizeLookupTable(rows, {
+      targetRTP: 0.96, toleranceRTP: 0.005,
+      targetCV: 8.0, toleranceCV: 1.0,
+      targetHitRate: 0.30, toleranceHitRate: 0.02,
+      capMaxWin: 5_000_000,
+      nRowsOut: 10_000,
+      requireMaxReached: true,
+      maxRowRtpShare: 0.05,
+      maxIterations: 2,
+    });
+
+    expect(result.maxRowRtpShare).toBeLessThanOrEqual(0.05 + 0.001);  // tiny epsilon for quantize rounding
+    expect(result.toleranceMet.rtpConcentration).toBe(true);
+  });
+
+  it('9. respects maxRowRtpShare=1.0 (disabled cap, preserves old behavior)', () => {
+    const rng = makeRng(9);
+    const rows: LookupRow[] = [];
+    for (let i = 0; i < 5000; i++) {
+      rows.push({ sim: i, weight: 1, payoutCents: rng() > 0.7 ? Math.floor(rng() * 5000) : 0 });
+    }
+    const result = optimizeLookupTable(rows, {
+      targetRTP: 0.5, toleranceRTP: 0.5,
+      targetCV: 3, toleranceCV: 100,
+      targetHitRate: 0.3, toleranceHitRate: 0.5,
+      capMaxWin: 5000,
+      nRowsOut: 500,
+      requireMaxReached: false,
+      maxRowRtpShare: 1.0,
+      maxIterations: 2,
+    });
+    // With disabled cap, no warning about concentration
+    expect(result.warnings.find(w => w.includes('maxRowRtpShare'))).toBeUndefined();
+  });
+
   it('6. handles nRowsOut=5000 without n² memory blowup', () => {
     // Pre-fix this would allocate a 5000×5000 dense matrix (200 MB Float64);
     // after the implicit-Tikhonov fix it should fit in well under 100 MB and

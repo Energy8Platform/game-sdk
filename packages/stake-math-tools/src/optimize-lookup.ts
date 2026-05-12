@@ -20,6 +20,7 @@ const DEFAULTS = {
   maxIterations: 5,
   bucketCount: 100,
   minPerBucket: 3,
+  maxRowRtpShare: 0.05,
 };
 
 export function optimizeLookupTable(
@@ -33,6 +34,7 @@ export function optimizeLookupTable(
   const maxIterations = params.maxIterations ?? DEFAULTS.maxIterations;
   const bucketCount = params.bucketCount ?? DEFAULTS.bucketCount;
   let minPerBucket = params.minPerBucket ?? DEFAULTS.minPerBucket;
+  const maxRowRtpShare = params.maxRowRtpShare ?? DEFAULTS.maxRowRtpShare;
 
   const warnings: string[] = [];
 
@@ -67,7 +69,16 @@ export function optimizeLookupTable(
   }
 
   // ── Phases 2–6: try, expand, retry ────────────────────────────────────────────
-  let best: { rows: LookupRow[]; achieved: OptimizeAchieved; toleranceMet: ToleranceMet; lossSum: number } | null = null;
+  let best:
+    | {
+        rows: LookupRow[];
+        achieved: OptimizeAchieved;
+        toleranceMet: ToleranceMet;
+        maxRowShare: number;
+        lossSum: number;
+        capWarning?: string;
+      }
+    | null = null;
 
   for (let iter = 0; iter < maxIterations; iter++) {
     const rng = mulberry32(seed + iter);
@@ -140,6 +151,118 @@ export function optimizeLookupTable(
       muHat = newMu;
     }
 
+    // ── Iterative RTP-share cap (Stake Engine "Within Liability Limits") ─────
+    //
+    // After NNLS converges, one or a few rows may dominate the total RTP. Stake
+    // Engine rejects tables where a single row carries an oversized share of the
+    // expected return. We iteratively cap any such row's weight and re-solve the
+    // (smaller) NNLS problem on the remaining rows until no violator remains or
+    // the iteration budget is exhausted.
+    const fixedWeight = new Map<number, number>(); // candidate index → fixed weight
+    let capIters = 0;
+    const maxCapIters = 50;
+    let capConverged = false;
+
+    while (capIters++ < maxCapIters) {
+      // Compute current total w·p (including fixed contributions)
+      let totalWP = 0;
+      for (let i = 0; i < candidates.length; i++) {
+        const w = fixedWeight.has(i) ? fixedWeight.get(i)! : weights[i];
+        totalWP += w * candidates[i].payoutCents;
+      }
+      if (totalWP <= 0) {
+        capConverged = true;
+        break;
+      }
+
+      // Find violators (only among non-fixed rows)
+      const violators: number[] = [];
+      for (let i = 0; i < candidates.length; i++) {
+        if (fixedWeight.has(i)) continue;
+        const w = weights[i];
+        const share = (w * candidates[i].payoutCents) / totalWP;
+        if (share > maxRowRtpShare) violators.push(i);
+      }
+      if (violators.length === 0) {
+        capConverged = true;
+        break;
+      }
+
+      // Cap each violator at maxRowRtpShare × totalWP / payout (truncate to integer)
+      for (const i of violators) {
+        const p = candidates[i].payoutCents;
+        const cappedW = Math.max(1, Math.floor((maxRowRtpShare * totalWP) / Math.max(1, p)));
+        fixedWeight.set(i, cappedW);
+      }
+
+      // Re-run NNLS on remaining (non-fixed) candidates
+      const remainingIdx: number[] = [];
+      for (let i = 0; i < candidates.length; i++) {
+        if (!fixedWeight.has(i)) remainingIdx.push(i);
+      }
+      if (remainingIdx.length < 4) break; // not enough rows to solve
+
+      // Compute fixed contributions to subtract from b
+      let fixedW_RTP = 0;
+      let fixedW_CV = 0;
+      let fixedW_HR = 0;
+      let fixedW_Sum = 0;
+      for (const [idx, w] of fixedWeight) {
+        const p = candidates[idx].payoutCents;
+        fixedW_RTP += (w * p) / params.toleranceRTP;
+        fixedW_CV +=
+          (w * Math.pow(p - muHat, 2)) / Math.max(1, params.toleranceCV * muHat * muHat);
+        fixedW_HR += (w * (p > 0 ? 1 : 0)) / params.toleranceHitRate;
+        fixedW_Sum += w / 1e-6;
+      }
+
+      // Build reduced A, b
+      const remCandidates = remainingIdx.map((i) => candidates[i]);
+      const A_r: number[][] = [
+        remCandidates.map((r) => r.payoutCents / params.toleranceRTP),
+        remCandidates.map(
+          (r) =>
+            Math.pow(r.payoutCents - muHat, 2) /
+            Math.max(1, params.toleranceCV * muHat * muHat),
+        ),
+        remCandidates.map((r) => (r.payoutCents > 0 ? 1 : 0) / params.toleranceHitRate),
+        remCandidates.map(() => 1 / 1e-6),
+      ];
+      const b_r = [
+        (params.targetRTP * totalWeightOut * 100) / params.toleranceRTP - fixedW_RTP,
+        (Math.pow(params.targetCV * muHat, 2) * totalWeightOut) /
+          Math.max(1, params.toleranceCV * muHat * muHat) -
+          fixedW_CV,
+        (params.targetHitRate * totalWeightOut) / params.toleranceHitRate - fixedW_HR,
+        totalWeightOut / 1e-6 - fixedW_Sum,
+      ];
+
+      let fixedTotalW = 0;
+      for (const w of fixedWeight.values()) fixedTotalW += w;
+      const remainingFreeWeight = Math.max(0, totalWeightOut - fixedTotalW);
+      const remPrior = new Array(remCandidates.length).fill(
+        Math.max(1, remainingFreeWeight / remCandidates.length),
+      );
+      const newSol = solveNNLS(A_r, b_r, {
+        prior: remPrior,
+        regularization: 1e-6,
+        maxIterations: 200,
+      });
+
+      // Splice back into the full weights array
+      for (let k = 0; k < remainingIdx.length; k++) {
+        weights[remainingIdx[k]] = Math.max(0, newSol[k]);
+      }
+      for (const [idx, w] of fixedWeight) {
+        weights[idx] = w;
+      }
+    }
+
+    const capWarning =
+      !capConverged && fixedWeight.size > 0
+        ? `maxRowRtpShare cap could not converge in ${maxCapIters} iterations`
+        : undefined;
+
     // Quantize
     const quantized = quantizeWeights(weights, totalWeightOut);
     const outRows: LookupRow[] = candidates.map((r, i) => ({
@@ -149,6 +272,18 @@ export function optimizeLookupTable(
     }));
 
     const achieved = computeMetrics(outRows);
+
+    // Compute the max single-row RTP share from final quantized output
+    let totalWPOut = 0;
+    for (const r of outRows) totalWPOut += r.weight * r.payoutCents;
+    let maxRowShare = 0;
+    if (totalWPOut > 0) {
+      for (const r of outRows) {
+        const share = (r.weight * r.payoutCents) / totalWPOut;
+        if (share > maxRowShare) maxRowShare = share;
+      }
+    }
+
     const toleranceMet: ToleranceMet = {
       rtp: Math.abs(achieved.rtp - params.targetRTP) <= params.toleranceRTP,
       cv: Math.abs(achieved.cv - params.targetCV) <= params.toleranceCV,
@@ -156,6 +291,7 @@ export function optimizeLookupTable(
       maxReached:
         !requireMaxReached ||
         outRows.some((r) => isNearMax(r.payoutCents, params.capMaxWin, maxReachedFraction)),
+      rtpConcentration: maxRowShare <= maxRowRtpShare,
     };
 
     // Loss for "best so far" tracking — Σ tolerance-normalized squared misses
@@ -163,15 +299,30 @@ export function optimizeLookupTable(
       Math.pow((achieved.rtp - params.targetRTP) / params.toleranceRTP, 2) +
       Math.pow((achieved.cv - params.targetCV) / params.toleranceCV, 2) +
       Math.pow((achieved.hitRate - params.targetHitRate) / params.toleranceHitRate, 2) +
-      (toleranceMet.maxReached ? 0 : 1000);
+      (toleranceMet.maxReached ? 0 : 1000) +
+      (toleranceMet.rtpConcentration ? 0 : 1000);
     if (!Number.isFinite(lossSum)) lossSum = Infinity;
 
     if (!best || lossSum < best.lossSum) {
-      best = { rows: outRows, achieved, toleranceMet, lossSum };
+      best = { rows: outRows, achieved, toleranceMet, maxRowShare, lossSum, capWarning };
     }
 
-    if (toleranceMet.rtp && toleranceMet.cv && toleranceMet.hitRate && toleranceMet.maxReached) {
-      return { rows: outRows, achieved, toleranceMet, warnings };
+    if (
+      toleranceMet.rtp &&
+      toleranceMet.cv &&
+      toleranceMet.hitRate &&
+      toleranceMet.maxReached &&
+      toleranceMet.rtpConcentration
+    ) {
+      const iterWarnings = warnings.slice();
+      if (capWarning) iterWarnings.push(capWarning);
+      return {
+        rows: outRows,
+        achieved,
+        toleranceMet,
+        maxRowRtpShare: maxRowShare,
+        warnings: iterWarnings,
+      };
     }
   }
 
@@ -196,6 +347,18 @@ export function optimizeLookupTable(
   if (!best.toleranceMet.maxReached) {
     warnings.push(`requireMaxReached=true but no near-max row in output`);
   }
+  if (!best.toleranceMet.rtpConcentration) {
+    warnings.push(
+      `maxRowRtpShare exceeded: ${(best.maxRowShare * 100).toFixed(2)}% > ${(maxRowRtpShare * 100).toFixed(2)}%`,
+    );
+  }
+  if (best.capWarning) warnings.push(best.capWarning);
 
-  return { rows: best.rows, achieved: best.achieved, toleranceMet: best.toleranceMet, warnings };
+  return {
+    rows: best.rows,
+    achieved: best.achieved,
+    toleranceMet: best.toleranceMet,
+    maxRowRtpShare: best.maxRowShare,
+    warnings,
+  };
 }

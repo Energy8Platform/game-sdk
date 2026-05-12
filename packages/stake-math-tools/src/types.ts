@@ -37,6 +37,12 @@ export interface OptimizeParams {
   bucketCount?: number;
   /** Minimum sample slots per non-empty non-zero bucket. Default 3. */
   minPerBucket?: number;
+
+  /** Maximum fraction of total RTP that any single output row may contribute.
+   *  Stake Engine's "Within Liability Limits" check fails when one row dominates RTP.
+   *  Default 0.05 (5%). Set to 1.0 to disable.
+   */
+  maxRowRtpShare?: number;
 }
 
 export interface OptimizeAchieved {
@@ -52,11 +58,15 @@ export interface ToleranceMet {
   cv: boolean;
   hitRate: boolean;
   maxReached: boolean;
+  /** True if no output row contributes more than maxRowRtpShare of total RTP. */
+  rtpConcentration: boolean;
 }
 
 export interface OptimizeResult {
   rows: LookupRow[];
   achieved: OptimizeAchieved;
   toleranceMet: ToleranceMet;
+  /** The single output row's largest fraction of total RTP. */
+  maxRowRtpShare: number;
   warnings: string[];
 }
