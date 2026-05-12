@@ -242,6 +242,64 @@ export function buildTieredLookup(
           `RTP refinement did not fully converge after ${refined.swaps} swaps (${gap.toFixed(2)}% gap)`,
         );
       }
+
+      // Third refinement pass: Σ-preserving 2-swap pass to nudge CV toward
+      // targetCV. RTP (Σ payout) is preserved within a 0.5% tolerance; only
+      // Σ payout² is re-shaped. Increases CV by swapping a moderate (mid,mid)
+      // pair from the sample for a spread (low,high) pair from outside; or
+      // the inverse to decrease CV.
+      //
+      // Math:
+      //   mean_out = (Σ_cap_payout + W × Σ_smallNz_payout) / T_out
+      //   target_var = (targetCV × mean_out)²
+      //   target E[X²] = target_var + mean_out² = mean_out² × (targetCV² + 1)
+      //   target Σ(w·p²) = target_E[X²] × T_out
+      //   target Σ_smallNz_p² = (target Σ(w·p²) − Σ_cap_p²) / W
+      if (params.targetCV > 0 && outSmallNonZero.length >= 2) {
+        const T_out = nHighOut + W * (nA + nB);
+        if (T_out > 0) {
+          let capSumP2 = 0;
+          for (const r of outCap) capSumP2 += r.payoutCents * r.payoutCents;
+          for (const r of outLarge) capSumP2 += r.payoutCents * r.payoutCents;
+
+          // mean_out predicted from converged RTP refinement.
+          const meanOutPredicted = (capSumP + W * refined.achievedSum) / T_out;
+          const targetEX2 = meanOutPredicted * meanOutPredicted * (params.targetCV ** 2 + 1);
+          const targetSumWP2 = targetEX2 * T_out;
+          const targetSmallNzSumP2 = W > 0 ? (targetSumWP2 - capSumP2) / W : 0;
+
+          if (targetSmallNzSumP2 > 0) {
+            // Use a tight cumulative Σ-drift cap so CV refinement doesn't
+            // disturb the RTP we just achieved. The per-swap tolerance only
+            // controls candidate filtering; the cumulative cap is enforced
+            // inside refineCvBySwap via the (lowerOk, upperOk) bounds.
+            //
+            // 0.1% Σ cap → up to 0.1% RTP drift. Tight enough to stay under
+            // the typical 0.125% kitsune tolerance, but loose enough to
+            // afford a few swaps when Σ² gap is large.
+            const cvSumTolerance = Math.max(1, 0.001 * targetSmallNzSumP);
+            const cvRefined = refineCvBySwap(
+              outSmallNonZero,
+              srcSmallNonZero,
+              targetSmallNzSumP2,
+              cvSumTolerance,
+              500,
+            );
+            outSmallNonZero = cvRefined.rows;
+
+            // Check RTP drift; warn if it grew past tolerance.
+            if (targetSmallNzSumP > 0) {
+              const rtpDrift =
+                Math.abs(cvRefined.achievedSum - targetSmallNzSumP) / targetSmallNzSumP;
+              if (rtpDrift > 0.005) {
+                warnings.push(
+                  `CV refinement drifted RTP by ${(rtpDrift * 100).toFixed(2)}% (${cvRefined.swaps} CV swaps)`,
+                );
+              }
+            }
+          }
+        }
+      }
     } else {
       // No RTP target signal (targetMeanNz <= 0 means cap already exceeds target,
       // or no non-zero slots): fall back to stratified shape-preserving sample.
@@ -580,6 +638,237 @@ function refineRtpBySwap(
   }
 
   return { rows: sampledArr, achievedSum, swaps, converged };
+}
+
+/**
+ * Σ-preserving 2-swap refinement to nudge CV toward target without
+ * disturbing Σ payout (RTP).
+ *
+ * A "2-swap" exchanges two rows (a, b) currently IN the sample for two rows
+ * (c, d) currently OUT, such that a + b ≈ c + d (within sumTolerance) and
+ * a² + b² ≠ c² + d². RTP is preserved; only the second moment shifts.
+ *
+ *   To INCREASE variance: swap moderate (mid, mid) → spread (low, high).
+ *   To DECREASE variance: swap spread (low, high) → moderate (mid, mid).
+ *
+ * Each iteration picks the best-improving swap from a small set of candidates
+ * at the extremes / median of the current sorted sample and outside pool.
+ */
+function refineCvBySwap(
+  sample: ReadonlyArray<LookupRow>,
+  pool: ReadonlyArray<LookupRow>,
+  targetSumPayout2: number,
+  sumTolerance: number,
+  maxSwaps: number,
+): { rows: LookupRow[]; achievedSum: number; achievedSum2: number; swaps: number } {
+  const inSet = new Set<number>();
+  for (const r of sample) inSet.add(r.sim);
+
+  let sumP = 0;
+  let sumP2 = 0;
+  for (const r of sample) {
+    sumP += r.payoutCents;
+    sumP2 += r.payoutCents * r.payoutCents;
+  }
+  const initialSumP = sumP;
+
+  const sampleArr = sample.slice().sort((a, b) => a.payoutCents - b.payoutCents);
+  const outsideArr: LookupRow[] = [];
+  for (const r of pool) {
+    if (!inSet.has(r.sim)) outsideArr.push(r);
+  }
+  outsideArr.sort((a, b) => a.payoutCents - b.payoutCents);
+
+  let swaps = 0;
+  while (swaps < maxSwaps) {
+    const deltaSum2 = targetSumPayout2 - sumP2;
+    if (Math.abs(deltaSum2) <= 1e-3 * Math.abs(targetSumPayout2)) break;
+
+    let bestSwap: {
+      sampleA: LookupRow;
+      sampleB: LookupRow;
+      sampleIdxA: number;
+      sampleIdxB: number;
+      outsideC: LookupRow;
+      outsideD: LookupRow;
+      outsideIdxC: number;
+      outsideIdxD: number;
+      newSum: number;
+      newSum2: number;
+      gain: number;
+      efficiency: number;
+    } | null = null;
+
+    // Strategy: for each sample pair (a, b) with a < b, find an outside pair
+    // (c, d) such that c + d ≈ a + b (RTP-preserving) but |c − (a+b)/2| ≠
+    // |a − (a+b)/2|, i.e., the outside pair has different spread than the
+    // sample pair. To INCREASE Σ p²: find outside pair with LARGER spread
+    // (one row below `a`, the other above `b`). To DECREASE Σ p²: find
+    // outside pair with SMALLER spread (both rows between `a` and `b`).
+    //
+    // Among heavy-tailed data the only pairs with non-trivial Σ² impact
+    // anchor on a high-payout row. So we iterate sample's "high" half (anchor
+    // = b, large index) and pair it with each anchor sample row a (a < b).
+    // For increase: find outside c < a with c + d ≈ a + b, where d = a+b−c
+    // and d must exist in outside near payout a+b−c, with d > b. For decrease:
+    // find outside c > a, c < b such that d = a+b−c is also in outside with
+    // a < d < b.
+    if (sampleArr.length < 2 || outsideArr.length < 2) break;
+
+    const sLen = sampleArr.length;
+    const outLen = outsideArr.length;
+
+    // Anchor count: how many sample pairs to probe per iteration. Larger →
+    // better swap selection but slower. K_HI focuses on the high-payout end
+    // (where Σ² is dominated); K_LO on the low end.
+    const K_HI = 8;
+    const K_LO = 8;
+
+    // For each candidate sample pair (aRow, bRow), choose outside `c` then
+    // derive targetD = (a + b) − c. Binary-search outside for d-rows near
+    // targetD. To INCREASE Σ²: pick c far from (a+b)/2 (more spread) — try
+    // very small or very large outside indices. To DECREASE Σ²: pick c near
+    // (a+b)/2 (less spread).
+    //
+    // We probe K_HI sample pairs anchored on high-payout sample rows (where
+    // Σ² is dominated) plus a smattering of mid-range pairs.
+    const cProbes = 32;
+    const sampleAnchorPairs: [number, number][] = [];
+    for (let hi = sLen - 1; hi >= Math.max(0, sLen - K_HI); hi--) {
+      for (let lo = 0; lo < Math.min(K_LO, hi); lo++) {
+        sampleAnchorPairs.push([lo, hi]);
+      }
+    }
+
+    for (const [lo, hi] of sampleAnchorPairs) {
+      const aRow = sampleArr[lo];
+      const bRow = sampleArr[hi];
+      if (aRow.payoutCents === bRow.payoutCents) continue;
+      const oldSum = aRow.payoutCents + bRow.payoutCents;
+      const oldSum2 =
+        aRow.payoutCents * aRow.payoutCents + bRow.payoutCents * bRow.payoutCents;
+
+      // Pick c candidates. For INCREASE: c far from oldSum/2 (extremes of
+      // outside). For DECREASE: c near oldSum/2.
+      const cIdxs: number[] = [];
+      if (deltaSum2 > 0) {
+        // Take extremes: smallest few and largest few outside rows.
+        const half = Math.ceil(cProbes / 2);
+        for (let s = 0; s < Math.min(half, outLen); s++) cIdxs.push(s);
+        for (let s = 0; s < Math.min(half, outLen); s++) {
+          const idx = outLen - 1 - s;
+          if (idx >= 0) cIdxs.push(idx);
+        }
+      } else {
+        // Center of outside near oldSum/2.
+        const target = oldSum / 2;
+        const center = lowerBoundIdx(outsideArr, target);
+        const half = Math.ceil(cProbes / 2);
+        for (let off = -half; off <= half; off++) {
+          const idx = center + off;
+          if (idx >= 0 && idx < outLen) cIdxs.push(idx);
+        }
+      }
+
+      // Tighten per-swap Σ drift: each candidate's newSum must stay within
+      // sumTolerance of initialSumP (cumulative cap), not oldSum (local cap).
+      const lowerOk = initialSumP - sumTolerance;
+      const upperOk = initialSumP + sumTolerance;
+
+      for (const ci of cIdxs) {
+        const cRow = outsideArr[ci];
+        const targetD = oldSum - cRow.payoutCents;
+        if (targetD <= 0) continue;
+        // Per-swap delta limited by remaining cumulative budget so total Σ
+        // stays within sumTolerance of initialSumP.
+        const remainingBudget = Math.max(0, sumTolerance - Math.abs(sumP - initialSumP));
+        const perSwapTol = Math.min(sumTolerance, remainingBudget + sumTolerance * 0.1);
+        const dIdxLB = lowerBoundIdx(outsideArr, targetD - perSwapTol);
+        const dIdxUB = lowerBoundIdx(outsideArr, targetD + perSwapTol + 1);
+        for (let di = dIdxLB; di < dIdxUB && di < outLen; di++) {
+          if (di === ci) continue;
+          const dRow = outsideArr[di];
+          const newSumPair = cRow.payoutCents + dRow.payoutCents;
+          const candNewSumP = sumP - oldSum + newSumPair;
+          // Cumulative drift constraint.
+          if (candNewSumP < lowerOk || candNewSumP > upperOk) continue;
+          const newSum2Pair =
+            cRow.payoutCents * cRow.payoutCents + dRow.payoutCents * dRow.payoutCents;
+          // Skip identity swap.
+          if (
+            (cRow.sim === aRow.sim && dRow.sim === bRow.sim) ||
+            (cRow.sim === bRow.sim && dRow.sim === aRow.sim)
+          )
+            continue;
+          const candNewSum2 = sumP2 - oldSum2 + newSum2Pair;
+          const gain = Math.abs(deltaSum2) - Math.abs(targetSumPayout2 - candNewSum2);
+          // Penalize swaps with non-zero Σ drift: efficiency = gain per unit
+          // of |Σ delta| consumed (with small ε to avoid div-by-zero).
+          const sumDelta = Math.abs(newSumPair - oldSum);
+          const efficiency = gain / (1 + sumDelta);
+          if (gain > 0 && (!bestSwap || efficiency > bestSwap.efficiency)) {
+            bestSwap = {
+              sampleA: aRow,
+              sampleB: bRow,
+              sampleIdxA: lo,
+              sampleIdxB: hi,
+              outsideC: cRow,
+              outsideD: dRow,
+              outsideIdxC: ci,
+              outsideIdxD: di,
+              newSum: candNewSumP,
+              newSum2: candNewSum2,
+              gain,
+              efficiency,
+            };
+          }
+        }
+      }
+    }
+
+    if (!bestSwap) break;
+
+    // Apply swap. Remove indices in descending order so earlier indices stay valid.
+    const sampleRemove = [bestSwap.sampleIdxA, bestSwap.sampleIdxB].sort((x, y) => y - x);
+    sampleArr.splice(sampleRemove[0], 1);
+    sampleArr.splice(sampleRemove[1], 1);
+    insertSorted(sampleArr, bestSwap.outsideC);
+    insertSorted(sampleArr, bestSwap.outsideD);
+
+    const outsideRemove = [bestSwap.outsideIdxC, bestSwap.outsideIdxD].sort((x, y) => y - x);
+    outsideArr.splice(outsideRemove[0], 1);
+    outsideArr.splice(outsideRemove[1], 1);
+    insertSorted(outsideArr, bestSwap.sampleA);
+    insertSorted(outsideArr, bestSwap.sampleB);
+
+    inSet.delete(bestSwap.sampleA.sim);
+    inSet.delete(bestSwap.sampleB.sim);
+    inSet.add(bestSwap.outsideC.sim);
+    inSet.add(bestSwap.outsideD.sim);
+
+    sumP = bestSwap.newSum;
+    sumP2 = bestSwap.newSum2;
+    swaps++;
+  }
+
+  return { rows: sampleArr, achievedSum: sumP, achievedSum2: sumP2, swaps };
+}
+
+function insertSorted(arr: LookupRow[], row: LookupRow): void {
+  const lo = lowerBoundIdx(arr, row.payoutCents);
+  arr.splice(lo, 0, row);
+}
+
+/** First index `i` with `arr[i].payoutCents >= target`. */
+function lowerBoundIdx(arr: ReadonlyArray<LookupRow>, target: number): number {
+  let lo = 0;
+  let hi = arr.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (arr[mid].payoutCents < target) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
 }
 
 /**
