@@ -62,6 +62,12 @@ refineCvBySwap   — Σ-preserving 2-swaps adjust Σ payout² toward │
                     achieved (Σ-drift bounded by toleranceRTP)  │
         │                                                       │
         ▼                                                       │
+fillStakeRangeGaps — for each Stake distribution range up to    │
+                     maxPayout that's empty but source has rows,│
+                     swap in a source row. Prevents "Gaps in    │
+                     the Hit Rate Table" rejection.             │
+        │                                                       │
+        ▼                                                       │
 W = n_high·(1 − target_cap_rate) / (n_small · target_cap_rate)  │
         │                                                       │
         ▼                                                       │
@@ -149,6 +155,7 @@ Full types in [`src/types.ts`](./src/types.ts). Internal helpers (`lawsonHansonN
 | `largePmThreshold` | `undefined` | pm in `[largePm, cap)` → large tier (weight 1). Set this to **lower the top-K RTP share** and improve Stake-Liability margin. Typical: 50–500. |
 | `largeTarget` | natural rate | Effective P(cap+large) in output. Override with Stake's per-tier limits if needed. |
 | `betCostCents` | `100` | Bet cost (1 bet = 100 cents). Used for pm = payoutCents / betCostCents. |
+| `ensureRangeCoverage` | `true` | Run a 4th refinement pass that guarantees every Stake distribution range up to actual maxPayout has ≥ 1 output row when source has rows in it. Prevents "Gaps in the Hit Rate Table" rejection. Set to `false` to disable. |
 
 ### Output sizing
 
@@ -214,6 +221,8 @@ Determinism: same `(rows, params)` → bit-identical output.
 For each bucket: `count` (rows in range), `effectiveHitRate` (Σ weight in range / total weight).
 
 `detectHitRateGaps(distribution)` returns the **intermediate** empty buckets (sandwiched between non-empty ones) — these are what Stake's "Gaps in the Hit Rate Table" check flags. Empty buckets at the tail (above the highest non-empty bucket) are natural and not flagged.
+
+The optimizer **proactively prevents** intermediate gaps via the `ensureRangeCoverage` pass (default on for tier-based): after RTP+CV refinement, any empty intermediate bucket gets a row swapped in from source. If a range can't be filled (source has no rows in that pm range), a warning is emitted — that's a game-design issue your simulation needs to address.
 
 ## Stake publish-UI mapping
 
