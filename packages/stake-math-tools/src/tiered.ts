@@ -221,12 +221,20 @@ export function buildTieredLookup(
       // Iterative swap refinement: close residual RTP gap by swapping
       // boundary rows in/out of the sample. Each swap is a single LookupRow
       // exchange, so the weight distribution remains exactly intact.
-      const tolerance = Math.max(1, 0.005 * targetSmallNzSumP); // 0.5% relative, floor 1 cent
+      //
+      // params.toleranceRTP is on LUT-RTP scale (e.g. 0.001 = 0.1pp LUT RTP).
+      // Achieved LUT RTP = (Σ_cap + W × Σ_smallNz) / (T × 100).
+      // Tolerable Σ_smallNz drift = toleranceRTP × T × 100 / W.
+      // Half it to leave a small safety budget for the CV pass that follows.
+      const T_out_predict = nHighOut + W * (nA + nB);
+      const rtpTolerance = W > 0 && T_out_predict > 0
+        ? Math.max(1, 0.5 * params.toleranceRTP * T_out_predict * 100 / W)
+        : Math.max(1, 0.005 * targetSmallNzSumP);
       const refined = refineRtpBySwap(
         outSmallNonZero,
         srcSmallNonZero,
         targetSmallNzSumP,
-        tolerance,
+        rtpTolerance,
         10000,
       );
       outSmallNonZero = refined.rows;
@@ -269,15 +277,14 @@ export function buildTieredLookup(
           const targetSmallNzSumP2 = W > 0 ? (targetSumWP2 - capSumP2) / W : 0;
 
           if (targetSmallNzSumP2 > 0) {
-            // Use a tight cumulative Σ-drift cap so CV refinement doesn't
-            // disturb the RTP we just achieved. The per-swap tolerance only
-            // controls candidate filtering; the cumulative cap is enforced
-            // inside refineCvBySwap via the (lowerOk, upperOk) bounds.
-            //
-            // 0.1% Σ cap → up to 0.1% RTP drift. Tight enough to stay under
-            // the typical 0.125% kitsune tolerance, but loose enough to
-            // afford a few swaps when Σ² gap is large.
-            const cvSumTolerance = Math.max(1, 0.001 * targetSmallNzSumP);
+            // Cumulative Σ-drift cap per CV pass = the OTHER HALF of the user's
+            // RTP tolerance budget (the first half was spent by refineRtpBySwap).
+            // Σ tolerance = 0.5 × toleranceRTP × T × 100 / W (same conversion).
+            // This guarantees that even after both passes, total RTP drift
+            // stays within params.toleranceRTP.
+            const cvSumTolerance = W > 0
+              ? Math.max(1, 0.5 * params.toleranceRTP * T_out * 100 / W)
+              : Math.max(1, 0.001 * targetSmallNzSumP);
             const cvRefined = refineCvBySwap(
               outSmallNonZero,
               srcSmallNonZero,
@@ -287,13 +294,15 @@ export function buildTieredLookup(
             );
             outSmallNonZero = cvRefined.rows;
 
-            // Check RTP drift; warn if it grew past tolerance.
-            if (targetSmallNzSumP > 0) {
-              const rtpDrift =
-                Math.abs(cvRefined.achievedSum - targetSmallNzSumP) / targetSmallNzSumP;
-              if (rtpDrift > 0.005) {
+            // Warn if CV refinement spent more RTP budget than half-toleranceRTP
+            // (e.g. due to integer rounding in cvSumTolerance vs actual swap deltas).
+            if (targetSmallNzSumP > 0 && params.toleranceRTP > 0) {
+              const rtpDriftAbs =
+                Math.abs(cvRefined.achievedSum - targetSmallNzSumP);
+              if (rtpDriftAbs > cvSumTolerance * 1.1) {
+                const rtpDriftPct = (rtpDriftAbs / targetSmallNzSumP) * 100;
                 warnings.push(
-                  `CV refinement drifted RTP by ${(rtpDrift * 100).toFixed(2)}% (${cvRefined.swaps} CV swaps)`,
+                  `CV refinement drifted RTP by ${rtpDriftPct.toFixed(3)}% (${cvRefined.swaps} CV swaps)`,
                 );
               }
             }
