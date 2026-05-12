@@ -139,6 +139,42 @@ describe('integration', () => {
     expect(sum).toBe(1000 * 1_000_000);
   });
 
+  it('7. row composition reflects targetHitRate (not just weighted hit-rate)', () => {
+    // Source distribution has hit-rate ≈ 0.30 (rng-controlled).
+    const rng = makeRng(7);
+    const rows: LookupRow[] = new Array(50_000);
+    for (let i = 0; i < 50_000; i++) {
+      const u = rng();
+      let p = 0;
+      if (u > 0.7) p = Math.floor(rng() * 200);
+      if (u > 0.97) p = Math.floor(rng() * 5_000);
+      if (u > 0.999) p = Math.floor(rng() * 50_000);
+      rows[i] = { sim: i, weight: 1 + Math.floor(rng() * 100), payoutCents: p };
+    }
+
+    // Target hit-rate well below source (0.20 vs 0.30)
+    const result = optimizeLookupTable(rows, {
+      targetRTP: 0.96, toleranceRTP: 0.01,
+      targetCV: 5.0, toleranceCV: 2.0,
+      targetHitRate: 0.20, toleranceHitRate: 0.02,
+      capMaxWin: 50_000,
+      nRowsOut: 1000,
+      requireMaxReached: false,
+      maxIterations: 3,
+    });
+
+    // Weighted hit-rate hits target.
+    expect(result.toleranceMet.hitRate).toBe(true);
+
+    // ROW composition is roughly 80% zero, 20% non-zero.
+    let nZero = 0;
+    for (const r of result.rows) if (r.payoutCents === 0) nZero++;
+    const zeroRowFraction = nZero / result.rows.length;
+    // Tolerance ±5% of (1 − targetHitRate).
+    expect(zeroRowFraction).toBeGreaterThan(0.75);
+    expect(zeroRowFraction).toBeLessThan(0.85);
+  });
+
   it('6. handles nRowsOut=5000 without n² memory blowup', () => {
     // Pre-fix this would allocate a 5000×5000 dense matrix (200 MB Float64);
     // after the implicit-Tikhonov fix it should fit in well under 100 MB and

@@ -80,6 +80,7 @@ export function optimizeLookupTable(
       nRowsOut: params.nRowsOut,
       minPerBucket,
       requireMaxReached,
+      targetHitRate: params.targetHitRate,
     });
     const sampledIdx = stratifiedSample(buckets, filtered, quotas, rng);
 

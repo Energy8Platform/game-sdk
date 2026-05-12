@@ -84,6 +84,11 @@ export interface QuotaParams {
   nRowsOut: number;
   minPerBucket: number;
   requireMaxReached: boolean;
+  /** Optional: bias the candidate pool toward this non-zero fraction (0..1).
+   *  When set, zeroBucket gets approximately `(1 − targetHitRate) × nRowsOut`
+   *  slots and the log buckets share the rest. When unset, current
+   *  variance-contribution distribution applies (zero gets leftover). */
+  targetHitRate?: number;
 }
 
 export interface Quotas {
@@ -103,7 +108,7 @@ export interface Quotas {
  * All quotas are integers and sum to nRowsOut.
  */
 export function computeQuotas(buckets: QuotaInput, params: QuotaParams): Quotas {
-  const { nRowsOut, minPerBucket, requireMaxReached } = params;
+  const { nRowsOut, minPerBucket, requireMaxReached, targetHitRate } = params;
 
   // Count non-empty log buckets — these are the ones eligible for minPerBucket.
   const nonEmptyLogCount = buckets.logBuckets.reduce(
@@ -112,6 +117,28 @@ export function computeQuotas(buckets: QuotaInput, params: QuotaParams): Quotas 
   );
   const wantNearMax = requireMaxReached && buckets.nearMaxBucket.indices.length > 0;
 
+  const totalAvailable =
+    buckets.zeroBucket.indices.length +
+    buckets.logBuckets.reduce((s, b) => s + b.indices.length, 0) +
+    buckets.nearMaxBucket.indices.length;
+  const expected = Math.min(nRowsOut, totalAvailable);
+
+  // ── targetHitRate-biased path ────────────────────────────────────────────
+  if (typeof targetHitRate === 'number' && targetHitRate > 0 && targetHitRate < 1) {
+    const result = computeQuotasByTargetHitRate(buckets, {
+      nRowsOut,
+      minPerBucket,
+      requireMaxReached,
+      targetHitRate,
+      nonEmptyLogCount,
+      wantNearMax,
+      totalAvailable,
+      expected,
+    });
+    return result;
+  }
+
+  // ── Original variance-contribution path ──────────────────────────────────
   // Compute an effective minPerBucket so the floor allocation does not exceed nRowsOut.
   // Floor at 0; near-max keeps its 1 slot when room allows, dropped only as a last resort.
   let effectiveMinPerBucket = minPerBucket;
@@ -185,15 +212,181 @@ export function computeQuotas(buckets: QuotaInput, params: QuotaParams): Quotas 
   // Defensive invariant: quotas must sum to exactly nRowsOut, unless the
   // total available indices across all buckets are fewer than nRowsOut (in
   // which case the cap at total available is the best achievable).
-  const totalAvailable =
-    buckets.zeroBucket.indices.length +
-    buckets.logBuckets.reduce((s, b) => s + b.indices.length, 0) +
-    buckets.nearMaxBucket.indices.length;
-  const expected = Math.min(nRowsOut, totalAvailable);
   const total = zeroQuota + logQuotas.reduce((s, q) => s + q, 0) + nearMaxQuota;
   if (total !== expected) {
     throw new Error(
       `computeQuotas invariant violated: total=${total}, expected=${expected} (nRowsOut=${nRowsOut}, totalAvailable=${totalAvailable})`,
+    );
+  }
+
+  return { zeroBucket: zeroQuota, logBuckets: logQuotas, nearMaxBucket: nearMaxQuota };
+}
+
+/**
+ * Splits `nRowsOut` so the candidate pool's non-zero fraction ≈ `targetHitRate`.
+ * This fixes the lopsided-row-composition bug in `optimizeLookupTable` when the
+ * source distribution's natural hit-rate is far from `targetHitRate`.
+ *
+ * The non-zero share is distributed across log + near-max buckets using the same
+ * (minPerBucket floor → variance-contribution remainder) heuristic as the
+ * default path, but constrained to a smaller budget. Any shortfall in either
+ * the zero or non-zero side spills over to the other side so total === nRowsOut.
+ */
+function computeQuotasByTargetHitRate(
+  buckets: QuotaInput,
+  ctx: {
+    nRowsOut: number;
+    minPerBucket: number;
+    requireMaxReached: boolean;
+    targetHitRate: number;
+    nonEmptyLogCount: number;
+    wantNearMax: boolean;
+    totalAvailable: number;
+    expected: number;
+  },
+): Quotas {
+  const { nRowsOut, minPerBucket, targetHitRate, nonEmptyLogCount, wantNearMax, totalAvailable, expected } = ctx;
+
+  const nonZeroAvailable =
+    buckets.logBuckets.reduce((s, b) => s + b.indices.length, 0) +
+    buckets.nearMaxBucket.indices.length;
+  const zeroAvailable = buckets.zeroBucket.indices.length;
+
+  let nonZeroSlots = Math.round(targetHitRate * nRowsOut);
+  let zeroSlots = nRowsOut - nonZeroSlots;
+
+  // Cap each side by what's available; spill the leftover to the other side.
+  if (nonZeroSlots > nonZeroAvailable) {
+    zeroSlots += nonZeroSlots - nonZeroAvailable;
+    nonZeroSlots = nonZeroAvailable;
+  }
+  if (zeroSlots > zeroAvailable) {
+    nonZeroSlots += zeroSlots - zeroAvailable;
+    zeroSlots = zeroAvailable;
+  }
+  // Final cap (only matters when totalAvailable < nRowsOut).
+  if (nonZeroSlots > nonZeroAvailable) nonZeroSlots = nonZeroAvailable;
+  if (zeroSlots > zeroAvailable) zeroSlots = zeroAvailable;
+
+  // Scale effectiveMinPerBucket down so the floor allocation fits within the
+  // non-zero budget. Same logic as the default path, just constrained to
+  // `nonZeroSlots` instead of `nRowsOut`.
+  let effectiveMinPerBucket = minPerBucket;
+  while (
+    effectiveMinPerBucket > 0 &&
+    nonEmptyLogCount * effectiveMinPerBucket + (wantNearMax ? 1 : 0) > nonZeroSlots
+  ) {
+    effectiveMinPerBucket--;
+  }
+  let nearMaxQuota =
+    wantNearMax && nonEmptyLogCount * effectiveMinPerBucket < nonZeroSlots ? 1 : 0;
+
+  const logQuotas = buckets.logBuckets.map((b) => {
+    if (b.indices.length === 0) return 0;
+    return Math.min(effectiveMinPerBucket, b.indices.length);
+  });
+
+  let assigned = logQuotas.reduce((s, q) => s + q, 0) + nearMaxQuota;
+  let remainingNonZero = nonZeroSlots - assigned;
+
+  // Variance-contribution remainder, with redistribution when any bucket caps
+  // out (so the non-zero budget gets fully consumed before spilling to zero).
+  if (remainingNonZero > 0) {
+    const contrib = buckets.logBuckets.map((b) => {
+      if (b.indices.length === 0) return 0;
+      const mean = b.weightedPayoutSum / Math.max(1, b.totalWeight);
+      return b.totalWeight * mean * mean;
+    });
+    // Iteratively allocate by contribution among non-capped buckets, then
+    // redistribute any over-allocation. Capped at log(nBuckets) + 1 passes.
+    let extraToPlace = remainingNonZero;
+    const eligible = buckets.logBuckets.map((b, i) => b.indices.length - logQuotas[i] > 0);
+    const maxPasses = buckets.logBuckets.length + 2;
+    for (let pass = 0; pass < maxPasses && extraToPlace > 0; pass++) {
+      let activeContrib = 0;
+      for (let i = 0; i < buckets.logBuckets.length; i++) {
+        if (eligible[i]) activeContrib += contrib[i];
+      }
+      if (activeContrib > 0) {
+        const proposed = buckets.logBuckets.map((_, i) =>
+          eligible[i] ? (contrib[i] / activeContrib) * extraToPlace : 0,
+        );
+        const floors = proposed.map(Math.floor);
+        const used = floors.reduce((s, v) => s + v, 0);
+        const remainders = proposed.map((p, i) => p - floors[i]);
+        const order = remainders
+          .map((_, i) => i)
+          .filter((i) => eligible[i])
+          .sort((a, b) => remainders[b] - remainders[a]);
+        let extra = extraToPlace - used;
+        for (const i of order) {
+          if (extra === 0) break;
+          floors[i]++;
+          extra--;
+        }
+        // Apply, capping at room.
+        let placed = 0;
+        for (let i = 0; i < floors.length; i++) {
+          if (!eligible[i] || floors[i] <= 0) continue;
+          const room = buckets.logBuckets[i].indices.length - logQuotas[i];
+          const give = Math.min(floors[i], room);
+          logQuotas[i] += give;
+          placed += give;
+          if (give === room) eligible[i] = false;
+        }
+        extraToPlace -= placed;
+        if (placed === 0) break; // No progress (everything is capped).
+      } else {
+        // No variance signal among eligible — fill remaining buckets evenly by room.
+        const order = buckets.logBuckets
+          .map((b, i) => ({ i, room: b.indices.length - logQuotas[i] }))
+          .filter((o) => o.room > 0 && eligible[o.i])
+          .sort((a, b) => b.room - a.room);
+        for (const { i, room } of order) {
+          if (extraToPlace === 0) break;
+          const give = Math.min(room, extraToPlace);
+          logQuotas[i] += give;
+          extraToPlace -= give;
+        }
+        break;
+      }
+    }
+    remainingNonZero = extraToPlace;
+  }
+
+  // If any non-zero slot is still unassigned (every log bucket capped),
+  // spill it to zero (only path left when totalAvailable still allows it).
+  if (remainingNonZero > 0) {
+    const headroomToZero = Math.min(remainingNonZero, zeroAvailable - zeroSlots);
+    zeroSlots += headroomToZero;
+    remainingNonZero -= headroomToZero;
+  }
+
+  let zeroQuota = Math.min(zeroSlots, zeroAvailable);
+
+  // If zero bucket can't soak its share, spill to the largest log buckets.
+  let leftover = zeroSlots - zeroQuota;
+  if (leftover > 0) {
+    const order = buckets.logBuckets
+      .map((b, i) => ({ i, room: b.indices.length - logQuotas[i] }))
+      .sort((a, b) => b.room - a.room);
+    for (const { i, room } of order) {
+      if (leftover === 0) break;
+      const give = Math.min(room, leftover);
+      logQuotas[i] += give;
+      leftover -= give;
+    }
+    if (leftover > 0 && wantNearMax && nearMaxQuota === 0 && buckets.nearMaxBucket.indices.length > 0) {
+      nearMaxQuota = 1;
+      leftover--;
+    }
+  }
+
+  // Final defensive invariant.
+  const total = zeroQuota + logQuotas.reduce((s, q) => s + q, 0) + nearMaxQuota;
+  if (total !== expected) {
+    throw new Error(
+      `computeQuotas invariant violated (targetHitRate path): total=${total}, expected=${expected} (nRowsOut=${nRowsOut}, totalAvailable=${totalAvailable}, targetHitRate=${targetHitRate})`,
     );
   }
 

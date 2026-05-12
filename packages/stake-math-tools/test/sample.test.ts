@@ -99,6 +99,82 @@ describe('computeQuotas (over-allocation guard)', () => {
   });
 });
 
+describe('computeQuotas — targetHitRate bias', () => {
+  it('allocates zero/nonzero quotas proportional to targetHitRate', () => {
+    const zero: Bucket = {
+      indices: Array.from({ length: 5000 }, (_, i) => i),
+      totalWeight: 5000,
+      weightedPayoutSum: 0,
+    };
+    const log: Bucket[] = Array.from({ length: 5 }, (_, k) => ({
+      indices: Array.from({ length: 200 }, (_, j) => 5000 + k * 200 + j),
+      totalWeight: 200,
+      weightedPayoutSum: 200 * (10 ** (k + 1)),
+    }));
+    const nearMax: Bucket = { indices: [5999], totalWeight: 1, weightedPayoutSum: 1000 };
+    const quotas = computeQuotas(
+      { zeroBucket: zero, logBuckets: log, nearMaxBucket: nearMax },
+      { nRowsOut: 1000, minPerBucket: 3, requireMaxReached: false, targetHitRate: 0.2 },
+    );
+    // Expect ~800 zero and ~200 non-zero (including across log buckets)
+    expect(quotas.zeroBucket).toBeGreaterThanOrEqual(750);
+    expect(quotas.zeroBucket).toBeLessThanOrEqual(850);
+    const totalNonZero = quotas.logBuckets.reduce((s, q) => s + q, 0) + quotas.nearMaxBucket;
+    expect(totalNonZero).toBeGreaterThanOrEqual(150);
+    expect(totalNonZero).toBeLessThanOrEqual(250);
+    const total = quotas.zeroBucket + totalNonZero;
+    expect(total).toBe(1000);
+  });
+
+  it('falls back to variance-contribution behavior when targetHitRate is unset', () => {
+    // Same buckets as the very first computeQuotas test in this file — invariant
+    // must be preserved (zero bucket absorbs leftover; total === nRowsOut).
+    const zero: Bucket = { indices: Array(100).fill(0).map((_, i) => i), totalWeight: 100, weightedPayoutSum: 0 };
+    const log: Bucket[] = [
+      { indices: [100, 101, 102], totalWeight: 3, weightedPayoutSum: 30 },
+      { indices: [103, 104, 105, 106, 107], totalWeight: 5, weightedPayoutSum: 200 },
+      { indices: [], totalWeight: 0, weightedPayoutSum: 0 },
+    ];
+    const nearMax: Bucket = { indices: [107], totalWeight: 1, weightedPayoutSum: 100 };
+    const quotas = computeQuotas(
+      { zeroBucket: zero, logBuckets: log, nearMaxBucket: nearMax },
+      { nRowsOut: 20, minPerBucket: 3, requireMaxReached: true /* no targetHitRate */ },
+    );
+    // Pre-fix invariants — same as the original test
+    expect(quotas.logBuckets[0]).toBeGreaterThanOrEqual(3);
+    expect(quotas.logBuckets[1]).toBeGreaterThanOrEqual(3);
+    expect(quotas.logBuckets[2]).toBe(0);
+    expect(quotas.nearMaxBucket).toBeGreaterThanOrEqual(1);
+    const total = quotas.zeroBucket + quotas.logBuckets.reduce((a, b) => a + b, 0) + quotas.nearMaxBucket;
+    expect(total).toBe(20);
+  });
+
+  it('handles targetHitRate=0.5 on a balanced distribution', () => {
+    const zero: Bucket = {
+      indices: Array.from({ length: 1000 }, (_, i) => i),
+      totalWeight: 1000,
+      weightedPayoutSum: 0,
+    };
+    const log: Bucket[] = Array.from({ length: 5 }, (_, k) => ({
+      indices: Array.from({ length: 200 }, (_, j) => 1000 + k * 200 + j),
+      totalWeight: 200,
+      weightedPayoutSum: 200 * (10 ** (k + 1)),
+    }));
+    const nearMax: Bucket = { indices: [1999], totalWeight: 1, weightedPayoutSum: 1000 };
+    const quotas = computeQuotas(
+      { zeroBucket: zero, logBuckets: log, nearMaxBucket: nearMax },
+      { nRowsOut: 500, minPerBucket: 3, requireMaxReached: false, targetHitRate: 0.5 },
+    );
+    expect(quotas.zeroBucket).toBeGreaterThanOrEqual(225);
+    expect(quotas.zeroBucket).toBeLessThanOrEqual(275);
+    const totalNonZero = quotas.logBuckets.reduce((s, q) => s + q, 0) + quotas.nearMaxBucket;
+    expect(totalNonZero).toBeGreaterThanOrEqual(225);
+    expect(totalNonZero).toBeLessThanOrEqual(275);
+    const total = quotas.zeroBucket + totalNonZero;
+    expect(total).toBe(500);
+  });
+});
+
 describe('stratifiedSample (overlap top-up)', () => {
   it('delivers exactly the total quota even when near-max overlaps log buckets', () => {
     // Top log bucket overlaps near-max bucket; near-max consumes enough that the
