@@ -285,11 +285,22 @@ export function buildTieredLookup(
             const cvSumTolerance = W > 0
               ? Math.max(1, 0.5 * params.toleranceRTP * T_out * 100 / W)
               : Math.max(1, 0.001 * targetSmallNzSumP);
+            // CV convergence threshold in Σ²-space:
+            //   target E[X²] = mean² × (CV² + 1)
+            //   d(Σ²_smallNz) / dCV = 2 × CV × mean² × T / W
+            //   Σ²-tolerance = 2 × targetCV × mean² × T × toleranceCV / W
+            // Stop swapping when Σ² is within this band of target.
+            const cvSum2Tolerance = W > 0 && params.toleranceCV > 0 && params.targetCV > 0
+              ? Math.max(1,
+                  2 * params.targetCV * meanOutPredicted * meanOutPredicted *
+                  T_out * params.toleranceCV / W)
+              : Math.max(1, 0.001 * Math.abs(targetSmallNzSumP2));
             const cvRefined = refineCvBySwap(
               outSmallNonZero,
               srcSmallNonZero,
               targetSmallNzSumP2,
               cvSumTolerance,
+              cvSum2Tolerance,
               500,
             );
             outSmallNonZero = cvRefined.rows;
@@ -668,6 +679,7 @@ function refineCvBySwap(
   pool: ReadonlyArray<LookupRow>,
   targetSumPayout2: number,
   sumTolerance: number,
+  sum2Tolerance: number,
   maxSwaps: number,
 ): { rows: LookupRow[]; achievedSum: number; achievedSum2: number; swaps: number } {
   const inSet = new Set<number>();
@@ -691,7 +703,7 @@ function refineCvBySwap(
   let swaps = 0;
   while (swaps < maxSwaps) {
     const deltaSum2 = targetSumPayout2 - sumP2;
-    if (Math.abs(deltaSum2) <= 1e-3 * Math.abs(targetSumPayout2)) break;
+    if (Math.abs(deltaSum2) <= sum2Tolerance) break;
 
     let bestSwap: {
       sampleA: LookupRow;
