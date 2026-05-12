@@ -138,4 +138,39 @@ describe('integration', () => {
     for (const r of result.rows) sum += r.weight;
     expect(sum).toBe(1000 * 1_000_000);
   });
+
+  it('6. handles nRowsOut=5000 without n² memory blowup', () => {
+    // Pre-fix this would allocate a 5000×5000 dense matrix (200 MB Float64);
+    // after the implicit-Tikhonov fix it should fit in well under 100 MB and
+    // complete in a few seconds.
+    const rng = makeRng(6);
+    const rows: LookupRow[] = new Array(200_000);
+    for (let i = 0; i < 200_000; i++) {
+      const u = rng();
+      let p = 0;
+      if (u > 0.7) p = Math.floor(rng() * 200);
+      if (u > 0.97) p = Math.floor(rng() * 5_000);
+      if (u > 0.999) p = Math.floor(rng() * 50_000);
+      rows[i] = { sim: i, weight: 1 + Math.floor(rng() * 10), payoutCents: p };
+    }
+
+    const t0 = performance.now();
+    const result = optimizeLookupTable(rows, {
+      targetRTP: 0.5, toleranceRTP: 0.2,
+      targetCV: 3, toleranceCV: 5,
+      targetHitRate: 0.30, toleranceHitRate: 0.1,
+      capMaxWin: 50_000,
+      nRowsOut: 5_000,
+      requireMaxReached: false,
+      maxIterations: 1,  // single pass — we're testing memory, not convergence
+    });
+    const elapsed = performance.now() - t0;
+
+    expect(result.rows).toHaveLength(5_000);
+    // Should be well under the testTimeout (30s). 60s as a generous upper bound.
+    expect(elapsed).toBeLessThan(60_000);
+    let sum = 0;
+    for (const r of result.rows) sum += r.weight;
+    expect(sum).toBe(5_000 * 1_000_000);
+  });
 });

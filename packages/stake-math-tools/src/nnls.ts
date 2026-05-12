@@ -17,8 +17,9 @@ export interface NNLSOptions {
  *   A is m×n (rows = features, cols = variables). m ≪ n is permitted thanks to ε > 0.
  *
  * Algorithm: classical active-set NNLS as in Lawson & Hanson §23.3. The Tikhonov term
- * is folded in by appending √ε · I to A and √ε · prior to b — the augmented system
- * (m+n) × n is then well-posed for all passive subsets.
+ * is applied *implicitly* — we never materialize the √ε · I block. Folding it into
+ * the gradient and the normal equations keeps the storage at O(m · n) instead of
+ * O(n²), which matters when n can reach 10⁵.
  */
 export function solveNNLS(
   A: ReadonlyArray<ReadonlyArray<number>>,
@@ -32,34 +33,25 @@ export function solveNNLS(
   const tol = options.tolerance ?? 1e-12;
   const maxIter = options.maxIterations ?? 3 * Math.max(1, n);
 
-  // Augment: A_aug = [A; √ε I],  b_aug = [b; √ε · prior]
-  const sqrtEps = Math.sqrt(epsilon);
-  const M = m + (epsilon > 0 ? n : 0);
-  const Ah: number[][] = new Array(M);
-  const bh: number[] = new Array(M);
-  for (let i = 0; i < m; i++) {
-    Ah[i] = A[i].slice();
-    bh[i] = b[i];
-  }
-  if (epsilon > 0) {
-    for (let j = 0; j < n; j++) {
-      const row = new Array(n).fill(0);
-      row[j] = sqrtEps;
-      Ah[m + j] = row;
-      bh[m + j] = sqrtEps * prior[j];
-    }
-  }
+  // No augmentation: A stays m×n. Tikhonov enters only via the gradient
+  // (in lawsonHansonNNLS) and the normal equations (in solveLS).
+  // Shallow-copy A to a mutable number[][] for the inner routine.
+  const Ah: number[][] = new Array(m);
+  for (let i = 0; i < m; i++) Ah[i] = A[i].slice();
+  const bh: number[] = b.slice();
 
-  return lawsonHansonNNLS(Ah, bh, n, tol, maxIter);
+  return lawsonHansonNNLS(Ah, bh, n, tol, maxIter, epsilon, prior);
 }
 
 /**
- * Lawson–Hanson active-set NNLS, matrix form. Returns x ≥ 0 minimizing ||A x − b||².
+ * Lawson–Hanson active-set NNLS, matrix form. Returns x ≥ 0 minimizing
+ * ||A x − b||² + ε ||x − prior||².
  *
  * Variables:
  *   P (passive set): indices where x_i > 0, x_i is "free"
  *   Z (active set):  indices where x_i = 0, x_i is "constrained"
- *   w = Aᵀ(b − Ax) — gradient of the residual squared (negated)
+ *   w = A_augᵀ(b_aug − A_aug x) — gradient of the augmented residual squared (negated).
+ *       Split as w_j = (Aᵀ(b − A x))_j + ε · (prior_j − x_j).
  *
  * Outer loop: pick the most negative-gradient index from Z, move it to P.
  * Inner loop: solve unconstrained LS on P; if any x_i ≤ 0, perform an interpolation
@@ -71,6 +63,8 @@ function lawsonHansonNNLS(
   n: number,
   tol: number,
   maxIter: number,
+  epsilon: number,
+  prior: ReadonlyArray<number>,
 ): number[] {
   const m = A.length;
   const x = new Array(n).fill(0);
@@ -78,18 +72,19 @@ function lawsonHansonNNLS(
   let iter = 0;
 
   while (iter++ < maxIter) {
-    // residual r = b − A x
+    // residual r = b − A x  (against the un-augmented A only)
     const r = b.slice();
     for (let i = 0; i < m; i++) {
       let s = 0;
       for (let j = 0; j < n; j++) s += A[i][j] * x[j];
       r[i] -= s;
     }
-    // w = Aᵀ r
+    // w = Aᵀ r + ε · (prior − x)   ← implicit Tikhonov in the gradient
     const w = new Array(n).fill(0);
     for (let j = 0; j < n; j++) {
       let s = 0;
       for (let i = 0; i < m; i++) s += A[i][j] * r[i];
+      if (epsilon > 0) s += epsilon * (prior[j] - x[j]);
       w[j] = s;
     }
 
@@ -112,7 +107,7 @@ function lawsonHansonNNLS(
       // Solve LS over P only
       const pIdx: number[] = [];
       for (let j = 0; j < n; j++) if (inP[j]) pIdx.push(j);
-      const sP = solveLS(A, b, pIdx);
+      const sP = solveLS(A, b, pIdx, epsilon, prior);
       // Build full s
       const s = new Array(n).fill(0);
       for (let k = 0; k < pIdx.length; k++) s[pIdx[k]] = sP[k];
@@ -153,12 +148,23 @@ function lawsonHansonNNLS(
 }
 
 /**
- * Solve unconstrained LS for the passive subset: argmin ‖A_P x_P − b‖² where A_P
- * is the columns of A indexed by `pIdx`. Uses normal equations (A_Pᵀ A_P) x = A_Pᵀ b
+ * Solve unconstrained LS for the passive subset: argmin ‖A_P x_P − b‖² + ε ‖x_P − prior_P‖²
+ * where A_P is the columns of A indexed by `pIdx`. Uses normal equations
+ *   (A_Pᵀ A_P + ε I) x = A_Pᵀ b + ε · prior_P
  * with Gaussian elimination — adequate for the small passive sets that arise in
  * Tikhonov-regularized NNLS (|P| ≤ m + a few extras at convergence).
+ *
+ * The Tikhonov term enters as +ε on the Gram diagonal and +ε·prior on the RHS,
+ * which is exactly what augmenting A with √ε · I would produce — without the
+ * O(n²) storage.
  */
-function solveLS(A: number[][], b: number[], pIdx: ReadonlyArray<number>): number[] {
+function solveLS(
+  A: number[][],
+  b: number[],
+  pIdx: ReadonlyArray<number>,
+  epsilon = 0,
+  prior?: ReadonlyArray<number>,
+): number[] {
   const m = A.length;
   const k = pIdx.length;
   if (k === 0) return [];
@@ -175,6 +181,14 @@ function solveLS(A: number[][], b: number[], pIdx: ReadonlyArray<number>): numbe
     let s = 0;
     for (let i = 0; i < m; i++) s += A[i][pIdx[a]] * b[i];
     G[a][k] = s;
+  }
+
+  // Implicit Tikhonov: add ε to the Gram diagonal and ε·prior to the RHS.
+  if (epsilon > 0) {
+    for (let col = 0; col < k; col++) {
+      G[col][col] += epsilon;
+      if (prior !== undefined) G[col][k] += epsilon * prior[pIdx[col]];
+    }
   }
 
   // Gaussian elimination with partial pivoting
