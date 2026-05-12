@@ -1,5 +1,6 @@
 // src/index.ts
 export { optimizeLookupTable } from './optimize-lookup.js';
+export { buildTieredLookup } from './tiered.js';
 export type {
   LookupRow,
   OptimizeParams,

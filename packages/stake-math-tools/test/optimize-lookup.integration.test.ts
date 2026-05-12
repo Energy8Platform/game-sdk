@@ -51,6 +51,7 @@ describe('integration', () => {
       nRowsOut: 200,
       requireMaxReached: false,
       maxIterations: 3,
+      algorithm: 'nnls',
     });
     expect(result.toleranceMet.rtp).toBe(true);
     expect(result.toleranceMet.hitRate).toBe(true);
@@ -66,6 +67,7 @@ describe('integration', () => {
       nRowsOut: 300,
       requireMaxReached: false,
       maxIterations: 3,
+      algorithm: 'nnls',
     });
     expect(result.toleranceMet.rtp).toBe(true);
   });
@@ -80,6 +82,7 @@ describe('integration', () => {
       nRowsOut: 100,
       requireMaxReached: false,
       maxIterations: 2,
+      algorithm: 'nnls',
     });
     expect(result.toleranceMet.cv).toBe(false);
     expect(result.warnings.some((w) => /CV/i.test(w))).toBe(true);
@@ -130,6 +133,7 @@ describe('integration', () => {
       nRowsOut: 1000,
       requireMaxReached: false,
       maxIterations: 2,
+      algorithm: 'nnls',
     });
     const elapsed = performance.now() - t0;
 
@@ -161,6 +165,7 @@ describe('integration', () => {
       nRowsOut: 1000,
       requireMaxReached: false,
       maxIterations: 3,
+      algorithm: 'nnls',
     });
 
     // Weighted hit-rate hits target.
@@ -197,6 +202,7 @@ describe('integration', () => {
       maxRowRtpShare: 0.05,
       maxWeightPerRow: Infinity,  // isolate RTP-share cap from weight cap
       maxIterations: 2,
+      algorithm: 'nnls',
     });
 
     expect(result.maxRowRtpShare).toBeLessThanOrEqual(0.05 + 0.001);  // tiny epsilon for quantize rounding
@@ -379,6 +385,7 @@ describe('integration', () => {
       nRowsOut: 5_000,
       requireMaxReached: false,
       maxIterations: 1,  // single pass — we're testing memory, not convergence
+      algorithm: 'nnls',
     });
     const elapsed = performance.now() - t0;
 
@@ -388,5 +395,101 @@ describe('integration', () => {
     let sum = 0;
     for (const r of result.rows) sum += r.weight;
     expect(sum).toBe(5_000 * 1_000_000);
+  });
+
+  it('14. tiered algorithm — preserves source distribution and bounds weight', () => {
+    const rng = makeRng(14);
+    const rows: LookupRow[] = new Array(100_000);
+    for (let i = 0; i < 100_000; i++) {
+      const u = rng();
+      let p = 0;
+      if (u > 0.7) p = Math.floor(rng() * 200);
+      if (u > 0.97) p = Math.floor(rng() * 5_000);
+      if (u > 0.999) p = Math.floor(rng() * 100_000);
+      rows[i] = { sim: i, weight: 1, payoutCents: p };
+    }
+
+    const result = optimizeLookupTable(rows, {
+      targetRTP: 0.5, toleranceRTP: 1.0,
+      targetCV: 5, toleranceCV: 100,
+      targetHitRate: 0.3, toleranceHitRate: 0.5,
+      capMaxWin: 100_000,
+      nRowsOut: 10_000,
+      requireMaxReached: false,
+      algorithm: 'tiered',
+    });
+
+    expect(result.rows).toHaveLength(10_000);
+    // Tier-based should keep maxWeightRatio bounded (typically ~1 for high tier, W for small)
+    // No row should have astronomical weight
+    let maxWeight = 0;
+    for (const r of result.rows) {
+      if (r.weight > maxWeight) maxWeight = r.weight;
+    }
+    // Tier-based bounds: cap=1, large=1, small=W. W is computed but typically modest.
+    // For this test, just check W isn't astronomical (< 1M).
+    expect(maxWeight).toBeLessThan(1_000_000);
+
+    // Stake report present
+    expect(result.stakeReport).toBeDefined();
+    expect(result.stakeReport.topKShare).toHaveLength(4);
+  });
+
+  it('15. tiered algorithm — explicit largeTarget controls effective rate', () => {
+    const rng = makeRng(15);
+    const rows: LookupRow[] = [];
+    for (let i = 0; i < 50_000; i++) {
+      let p = 0;
+      const u = rng();
+      if (u > 0.7) p = Math.floor(rng() * 200);
+      if (u > 0.99) p = Math.floor(rng() * 50_000);  // ~1% large rows in source
+      rows.push({ sim: i, weight: 1, payoutCents: p });
+    }
+
+    const result = optimizeLookupTable(rows, {
+      targetRTP: 0.5, toleranceRTP: 1.0,
+      targetCV: 5, toleranceCV: 100,
+      targetHitRate: 0.3, toleranceHitRate: 0.5,
+      capMaxWin: 50_000,
+      nRowsOut: 5_000,
+      requireMaxReached: false,
+      algorithm: 'tiered',
+      largePmThreshold: 100,   // pm >= 100 (= payout >= 10000 cents) = "large"
+      largeTarget: 0.001,      // 0.1% effective probability
+    });
+
+    // Find total weight on rows with payout >= 10000 cents
+    let largeWeight = 0, totalWeight = 0;
+    for (const r of result.rows) {
+      totalWeight += r.weight;
+      if (r.payoutCents >= 10_000) largeWeight += r.weight;
+    }
+    const effectiveLargeRate = largeWeight / totalWeight;
+    // Should be close to 0.001 (the largeTarget)
+    expect(effectiveLargeRate).toBeGreaterThan(0.0005);
+    expect(effectiveLargeRate).toBeLessThan(0.005);
+  });
+
+  it('16. NNLS algorithm still works via algorithm: "nnls"', () => {
+    const rng = makeRng(16);
+    const rows: LookupRow[] = [];
+    for (let i = 0; i < 5_000; i++) {
+      rows.push({ sim: i, weight: 1, payoutCents: rng() > 0.7 ? Math.floor(rng() * 5000) : 0 });
+    }
+    const result = optimizeLookupTable(rows, {
+      targetRTP: 0.5, toleranceRTP: 0.3,
+      targetCV: 3, toleranceCV: 100,
+      targetHitRate: 0.3, toleranceHitRate: 0.5,
+      capMaxWin: 5000,
+      nRowsOut: 500,
+      requireMaxReached: false,
+      algorithm: 'nnls',
+      maxRowRtpShare: 0.1,
+      maxWeightPerRow: Infinity,
+      maxIterations: 1,
+    });
+    // NNLS produces valid output
+    expect(result.rows).toHaveLength(500);
+    expect(result.stakeReport).toBeDefined();
   });
 });

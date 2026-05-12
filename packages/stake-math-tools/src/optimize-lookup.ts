@@ -13,6 +13,7 @@ import { bucketize } from './bucketize.js';
 import { mulberry32, computeQuotas, stratifiedSample } from './sample.js';
 import { solveNNLS } from './nnls.js';
 import { quantizeWeights } from './quantize.js';
+import { buildTieredLookup } from './tiered.js';
 
 const DEFAULTS = {
   requireMaxReached: true,
@@ -84,6 +85,11 @@ export function optimizeLookupTable(
   rowsIn: Iterable<LookupRow>,
   params: OptimizeParams,
 ): OptimizeResult {
+  const algorithm = params.algorithm ?? 'tiered';
+  if (algorithm === 'tiered') {
+    return buildTieredLookup(rowsIn, params);
+  }
+
   const requireMaxReached = params.requireMaxReached ?? DEFAULTS.requireMaxReached;
   const maxReachedFraction = params.maxReachedFraction ?? DEFAULTS.maxReachedFraction;
   const totalWeightOut = params.totalWeightOut ?? params.nRowsOut * DEFAULTS.totalWeightOutPerRow;

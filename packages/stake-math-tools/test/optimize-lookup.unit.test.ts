@@ -36,6 +36,7 @@ describe('optimizeLookupTable', () => {
       targetHitRate: 0.3, toleranceHitRate: 0.05,
       capMaxWin: 100_000,
       nRowsOut: 100,
+      algorithm: 'nnls',
     });
     expect(result.rows).toHaveLength(100);
     let sum = 0;
@@ -76,6 +77,7 @@ describe('optimizeLookupTable', () => {
       nRowsOut: 50,
       requireMaxReached: false,
       maxIterations: 2,
+      algorithm: 'nnls',
     });
     expect(result.toleranceMet.cv).toBe(false);
     expect(result.warnings.length).toBeGreaterThan(0);

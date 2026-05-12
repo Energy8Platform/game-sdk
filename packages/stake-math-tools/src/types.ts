@@ -54,6 +54,27 @@ export interface OptimizeParams {
    *  ("Within Liability Limits") check from failing due to over-concentrated weight.
    *  Default 10. Set to Infinity to disable. */
   maxWeightPerRow?: number;
+
+  /** Algorithm for compressing source rows into a weighted lookup table.
+   *  - 'tiered' (default): tier-based rarity weighting (cap/large rows get weight=1,
+   *    small rows get calculated weight W). Preserves source distribution rates;
+   *    passes Stake Engine's "Within Liability Limits" check.
+   *  - 'nnls': legacy NNLS optimization; hits RTP/CV/HR targets exactly but may
+   *    concentrate weight on few rows and fail Stake's Liability check. */
+  algorithm?: 'tiered' | 'nnls';
+
+  /** Tier-based only: payout multiplier (payoutCents / betCostCents) above which
+   *  a row is in the "cap" tier (weight=1, rare). Default: 0.95 × max source pm. */
+  capPmThreshold?: number;
+
+  /** Tier-based only: payout multiplier threshold for the "large" tier.
+   *  Rows with capPmThreshold > pm >= largePmThreshold get weight=1.
+   *  Default: undefined (no large tier — only cap vs small). */
+  largePmThreshold?: number;
+
+  /** Tier-based only: target effective probability for cap+large rows in output.
+   *  Default: natural rate from source = (n_cap + n_large) / n_source. */
+  largeTarget?: number;
 }
 
 export interface OptimizeAchieved {
