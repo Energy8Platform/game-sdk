@@ -16,4 +16,6 @@ export { mulberry32, weightedReservoirSample, computeQuotas, stratifiedSample } 
 export type { Quotas, QuotaInput, QuotaParams } from './sample.js';
 export { solveNNLS } from './nnls.js';
 export type { NNLSOptions } from './nnls.js';
+export { solveQP, projectSimplex } from './qp.js';
+export type { QPOptions } from './qp.js';
 export { quantizeWeights } from './quantize.js';

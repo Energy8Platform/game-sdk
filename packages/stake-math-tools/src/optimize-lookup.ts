@@ -9,7 +9,7 @@ import type {
 import { computeMetrics, isNearMax } from './metrics.js';
 import { bucketize } from './bucketize.js';
 import { mulberry32, computeQuotas, stratifiedSample } from './sample.js';
-import { solveNNLS } from './nnls.js';
+import { solveQP } from './qp.js';
 import { quantizeWeights } from './quantize.js';
 
 const DEFAULTS = {
@@ -93,8 +93,10 @@ export function optimizeLookupTable(
 
     const candidates = sampledIdx.map((i) => filtered[i]);
 
-    // Build A, b for NNLS — feature rows: RTP, var (using μ̂), hit-rate, sum
-    // Each feature row scaled by 1/tolerance so loss is "tolerance-units".
+    // Build A, b for the QP — feature rows: RTP, var (using μ̂), hit-rate.
+    // The sum constraint (Σx = totalWeightOut) is enforced by simplex projection
+    // inside solveQP, so we no longer pay for a "sum row" in A.
+    // Each feature row scaled by 1/tolerance so the loss is "tolerance-units".
     const muHatTarget = params.targetRTP * 100;
     let muHat = muHatTarget;
     let weights: number[] = [];
@@ -107,21 +109,27 @@ export function optimizeLookupTable(
         candidates.map((r) => Math.pow(r.payoutCents - muHat, 2) / Math.max(1, params.toleranceCV * muHat * muHat)),
         // Hit-rate row: 1 if payout > 0
         candidates.map((r) => (r.payoutCents > 0 ? 1 : 0) / params.toleranceHitRate),
-        // Sum row: 1 — heavily weighted (1/tolerance set very small ≡ very strict)
-        candidates.map(() => 1 / 1e-6),
       ];
       const bVec = [
         (params.targetRTP * totalWeightOut * 100) / params.toleranceRTP,
         (Math.pow(params.targetCV * muHat, 2) * totalWeightOut) / Math.max(1, params.toleranceCV * muHat * muHat),
         (params.targetHitRate * totalWeightOut) / params.toleranceHitRate,
-        totalWeightOut / 1e-6,
       ];
 
       const prior = new Array(candidates.length).fill(totalWeightOut / candidates.length);
-      const sol = solveNNLS(A, bVec, {
+      // FISTA's accelerated rate is O(√κ · log(1/tol)) and our objective is
+      // ill-conditioned: κ ≈ σ_max²(A)/ε can reach 10²² when the user's tolerances
+      // and payout magnitudes give A's columns wildly different norms. Even with
+      // Jacobi column-norm preconditioning + adaptive restart, hitting tight
+      // user tolerances (toleranceHitRate ~ 0.02, etc.) requires a generous
+      // iteration cap. 15k is comfortably enough for the entire test suite and
+      // the 1M→100K bench scenario.
+      const sol = solveQP(A, bVec, {
+        sumConstraint: totalWeightOut,
         prior,
         regularization: 1e-6,
-        maxIterations: 200,
+        maxIterations: 15000,
+        tolerance: 1e-9,
       });
       weights = sol;
 
