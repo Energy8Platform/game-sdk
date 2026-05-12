@@ -95,22 +95,148 @@ export function buildTieredLookup(
   }
 
   const slotsForSmall = params.nRowsOut - outCap.length - outLarge.length;
+  const warnings: string[] = [];
   let outSmall: LookupRow[] = [];
+  // Compute W and small-tier subdivision now, so we can do RTP-aware non-zero
+  // sampling using the same W used in the output.
+  let W = 1;
   if (slotsForSmall > 0 && srcSmall.length > 0) {
-    if (slotsForSmall >= srcSmall.length) {
-      outSmall = srcSmall;
-    } else {
-      // Stratified sample by log(payout) to preserve source distribution shape
-      // (uniform reservoir over-represents long tails → RTP drift).
-      const bucketCount = params.bucketCount ?? 100;
-      outSmall = stratifiedSmallSample(srcSmall, slotsForSmall, bucketCount, seed);
+    // Subdivide small into zero / non-zero so we can bias the sampling by
+    // params.targetHitRate. Tier-based preserves cap rate naturally, but the
+    // small-tier non-zero/zero composition can still be shifted to match a
+    // user-requested hit-rate.
+    const srcSmallZero: LookupRow[] = [];
+    const srcSmallNonZero: LookupRow[] = [];
+    for (const r of srcSmall) {
+      if (r.payoutCents === 0) srcSmallZero.push(r);
+      else srcSmallNonZero.push(r);
     }
+
+    // Target cap rate (cap + large weight share) — same `target` used for W below.
+    const target_cap_rate = target;
+    const targetHitRate = params.targetHitRate;
+
+    // Solve for n_B (non-zero small rows) so that effective hit-rate = targetHitRate.
+    // (nHighOut + W × n_B) / (nHighOut + W × nSmall) = h
+    // where W is computed below using the same `target_cap_rate` formula, which
+    // implies high contributes target_cap_rate of total weight and small carries
+    // the remaining 1 - target_cap_rate split uniformly across nSmall.
+    // → n_B = nSmall × [h − (1−h) × target_cap_rate / (1 − target_cap_rate)]
+    const nHighOut = outCap.length + outLarge.length;
+    let nB: number;
+    if (target_cap_rate >= 1 || nHighOut === 0) {
+      // No high tier or fully high: every small row contributes h share uniformly.
+      nB = Math.round(slotsForSmall * targetHitRate);
+    } else {
+      const denom = 1 - target_cap_rate;
+      nB = Math.round(
+        slotsForSmall * (targetHitRate - ((1 - targetHitRate) * target_cap_rate) / denom),
+      );
+    }
+    const requestedNB = nB;
+    nB = Math.max(0, Math.min(nB, slotsForSmall, srcSmallNonZero.length));
+    let nA = slotsForSmall - nB;
+    // If zero bucket can't absorb nA, redirect overflow to non-zero
+    if (nA > srcSmallZero.length) {
+      const overflow = nA - srcSmallZero.length;
+      nA = srcSmallZero.length;
+      nB = Math.min(nB + overflow, srcSmallNonZero.length);
+      // If still short, the output will simply be under-filled and padded later.
+    }
+
+    // Warnings on unreachable hit-rate targets.
+    // Priority:
+    //   1. Source has too few non-zero rows (covers nB===0 from empty source too).
+    //   2. Cap-rate alone already meets/exceeds the target (formula yields nB<=0).
+    if (
+      requestedNB > srcSmallNonZero.length &&
+      nB === srcSmallNonZero.length &&
+      targetHitRate > 0
+    ) {
+      warnings.push(
+        `source has only ${srcSmallNonZero.length} non-zero small rows; cannot reach targetHitRate=${targetHitRate}`,
+      );
+    } else if (requestedNB <= 0 && targetHitRate > 0 && nB === 0) {
+      warnings.push(
+        `targetHitRate=${targetHitRate} unreachable; cap+large weight share already meets or exceeds it (n_B clamped to 0)`,
+      );
+    }
+
+    const bucketCount = params.bucketCount ?? 100;
+    // Sample zero sub-bucket: uniform reservoir.
+    const outSmallZero =
+      nA >= srcSmallZero.length
+        ? [...srcSmallZero]
+        : uniformReservoirSample(srcSmallZero, nA, seed);
+
+    // RTP-aware non-zero sampling.
+    // Compute the W we will use in the output (mirrors Phase 5 below). We have
+    // nSmall = nA + nB once sampled; tier-based has bounded weights by design.
+    const nSmallTotal = nA + nB;
+    let WforSampling = 1;
+    if (nSmallTotal > 0 && target > 0 && target < 1) {
+      WforSampling = Math.max(
+        1,
+        Math.round((nHighOut * (1 - target)) / (nSmallTotal * target)),
+      );
+    } else if (nHighOut === 0) {
+      WforSampling = 1;
+    }
+    W = WforSampling;
+
+    // Compute target mean payout for the non-zero sample so the overall RTP
+    // hits params.targetRTP.
+    // Total weight T = nHighOut + W × (nA + nB)
+    // Σ(w·p) needed = targetRTP × T × betCost  (NOT × 100 — betCost may differ)
+    // Cap rows contribute Σ_cap = sum of cap+large payouts (weight=1 each)
+    // Σ_smallNz contribution = W × Σ_sampled_nz_payouts
+    // → Target Σ_sampled_nz_payouts = (targetRTP × T × betCost − Σ_cap) / W
+    const totalWeightTarget = nHighOut + W * (nA + nB);
+    const targetSumWP = params.targetRTP * totalWeightTarget * betCost;
+    let capSumP = 0;
+    for (const r of outCap) capSumP += r.payoutCents;
+    for (const r of outLarge) capSumP += r.payoutCents;
+    const targetSmallNzSumP = W > 0 ? (targetSumWP - capSumP) / W : 0;
+    const targetMeanNz = nB > 0 ? targetSmallNzSumP / nB : 0;
+
+    let outSmallNonZero: LookupRow[];
+    if (nB >= srcSmallNonZero.length) {
+      outSmallNonZero = [...srcSmallNonZero];
+    } else if (nB > 0 && targetMeanNz > 0) {
+      const sampleResult = rtpAwareSampleNonZero(
+        srcSmallNonZero,
+        nB,
+        targetMeanNz,
+        bucketCount,
+        seed + 1,
+      );
+      outSmallNonZero = sampleResult.sampled;
+      if (sampleResult.clamped) {
+        warnings.push(
+          `targetRTP=${params.targetRTP} unreachable for non-zero sample: requested mean payout ` +
+            `${targetMeanNz.toFixed(0)} cents but achieved ${sampleResult.achievedMean.toFixed(0)} cents`,
+        );
+      }
+    } else {
+      // No RTP target signal (targetMeanNz <= 0 means cap already exceeds target,
+      // or no non-zero slots): fall back to stratified shape-preserving sample.
+      outSmallNonZero =
+        nB > 0
+          ? stratifiedSmallSampleNonZero(srcSmallNonZero, nB, bucketCount, seed + 1)
+          : [];
+      if (nB > 0 && targetMeanNz <= 0 && targetSumWP > 0) {
+        warnings.push(
+          `targetRTP=${params.targetRTP} unreachable: cap+large rows alone already meet or exceed it`,
+        );
+      }
+    }
+
+    outSmall = [...outSmallZero, ...outSmallNonZero];
   }
 
-  // Phase 5: compute W
+  // Phase 5: compute W (recompute to match actual nSmall after sampling)
   const nHigh = outCap.length + outLarge.length;
   const nSmall = outSmall.length;
-  let W = 1;
   if (nSmall > 0 && target > 0 && target < 1) {
     W = Math.max(1, Math.round((nHigh * (1 - target)) / (nSmall * target)));
   } else if (nHigh === 0) {
@@ -164,7 +290,6 @@ export function buildTieredLookup(
   // Stake report
   const stakeReport = computeStakeReport(outRows, achieved, betCost);
 
-  const warnings: string[] = [];
   if (sourceMetrics.maxPayout < maxReachedFraction * params.capMaxWin && requireMaxReached) {
     warnings.push(
       `no row reaches ${maxReachedFraction * 100}% of capMaxWin; requireMaxReached cannot be honored`,
@@ -183,51 +308,177 @@ export function buildTieredLookup(
 }
 
 /**
- * Stratified sample of `k` rows from `smallRows`, partitioning by log(payout).
- * Each bucket contributes a slot count proportional to its size in the source,
- * so the sample preserves the source's per-bucket population and (in
- * expectation) the source's mean payout — which is critical for RTP fidelity.
+ * RTP-aware non-zero sample: pick `k` rows from `srcNonZero` such that their
+ * MEAN payout is approximately `targetMeanPayout`, while preserving shape
+ * within each side of the split via stratified sampling.
+ *
+ * Strategy — two-side analytical LP:
+ *   Split source into "low" (payout < targetMeanPayout) and "high" (>=).
+ *   Compute μ_low, μ_high.
+ *   Solve: n_high × μ_high + (k − n_high) × μ_low = k × targetMeanPayout
+ *     →   n_high = k × (targetMeanPayout − μ_low) / (μ_high − μ_low)
+ *   Clamp to [0, |high|] and [0, |low|], then stratified-sample within each.
+ *
+ * If clamping prevents reaching the target mean, returns clamped=true.
+ */
+function rtpAwareSampleNonZero(
+  srcNonZero: ReadonlyArray<LookupRow>,
+  k: number,
+  targetMeanPayout: number,
+  bucketCount: number,
+  seed: number,
+): { sampled: LookupRow[]; achievedMean: number; clamped: boolean } {
+  if (k === 0) return { sampled: [], achievedMean: 0, clamped: false };
+  if (k >= srcNonZero.length) {
+    let sum = 0;
+    for (const r of srcNonZero) sum += r.payoutCents;
+    const mean = srcNonZero.length > 0 ? sum / srcNonZero.length : 0;
+    return { sampled: [...srcNonZero], achievedMean: mean, clamped: true };
+  }
+
+  // Compute source mean for the early-exit "close enough" check.
+  let srcSum = 0;
+  for (const r of srcNonZero) srcSum += r.payoutCents;
+  const sourceMean = srcSum / srcNonZero.length;
+
+  // If target is within 1% of source mean, plain stratified sample is fine
+  // (no bias needed).
+  if (sourceMean > 0 && Math.abs(targetMeanPayout - sourceMean) / sourceMean < 0.01) {
+    const sampled = stratifiedSmallSampleNonZero(srcNonZero, k, bucketCount, seed);
+    let s = 0;
+    for (const r of sampled) s += r.payoutCents;
+    const mean = sampled.length > 0 ? s / sampled.length : 0;
+    return { sampled, achievedMean: mean, clamped: false };
+  }
+
+  // Split into low (payout < targetMean) and high (payout >= targetMean).
+  const low: LookupRow[] = [];
+  const high: LookupRow[] = [];
+  for (const r of srcNonZero) {
+    if (r.payoutCents < targetMeanPayout) low.push(r);
+    else high.push(r);
+  }
+  if (low.length === 0 || high.length === 0) {
+    // Target outside source range: can't reach it. Sample uniformly + clamp.
+    const sampled = stratifiedSmallSampleNonZero(srcNonZero, k, bucketCount, seed);
+    let s = 0;
+    for (const r of sampled) s += r.payoutCents;
+    const mean = sampled.length > 0 ? s / sampled.length : 0;
+    return { sampled, achievedMean: mean, clamped: true };
+  }
+
+  let lowSum = 0;
+  for (const r of low) lowSum += r.payoutCents;
+  let highSum = 0;
+  for (const r of high) highSum += r.payoutCents;
+  const muLow = lowSum / low.length;
+  const muHigh = highSum / high.length;
+
+  // Avoid division by zero if both groups collapse to same mean.
+  if (muHigh - muLow < 1e-9) {
+    const sampled = stratifiedSmallSampleNonZero(srcNonZero, k, bucketCount, seed);
+    let s = 0;
+    for (const r of sampled) s += r.payoutCents;
+    const mean = sampled.length > 0 ? s / sampled.length : 0;
+    return { sampled, achievedMean: mean, clamped: true };
+  }
+
+  let nHighOut = Math.round((k * (targetMeanPayout - muLow)) / (muHigh - muLow));
+  let clamped = false;
+  if (nHighOut < 0) {
+    nHighOut = 0;
+    clamped = true;
+  }
+  if (nHighOut > high.length) {
+    nHighOut = high.length;
+    clamped = true;
+  }
+  if (nHighOut > k) {
+    nHighOut = k;
+    clamped = true;
+  }
+  let nLowOut = k - nHighOut;
+  if (nLowOut > low.length) {
+    // Shouldn't happen given nHighOut bounds + (low+high=src) and k < src.length,
+    // but redirect overflow to high if it does.
+    const overflow = nLowOut - low.length;
+    nLowOut = low.length;
+    nHighOut = Math.min(nHighOut + overflow, high.length);
+    clamped = true;
+  }
+  if (nLowOut < 0) {
+    nLowOut = 0;
+    clamped = true;
+  }
+
+  const subBuckets = Math.max(2, Math.floor(bucketCount / 2));
+  const sampleLow =
+    nLowOut >= low.length
+      ? [...low]
+      : nLowOut > 0
+        ? stratifiedSmallSampleNonZero(low, nLowOut, subBuckets, seed)
+        : [];
+  const sampleHigh =
+    nHighOut >= high.length
+      ? [...high]
+      : nHighOut > 0
+        ? stratifiedSmallSampleNonZero(high, nHighOut, subBuckets, seed + 17)
+        : [];
+
+  const sampled = [...sampleLow, ...sampleHigh];
+  let sumOut = 0;
+  for (const r of sampled) sumOut += r.payoutCents;
+  const achievedMean = sampled.length > 0 ? sumOut / sampled.length : 0;
+  // If we hit a hard side cap (consumed entire low or entire high group), flag.
+  if (nHighOut === high.length || nLowOut === low.length) clamped = true;
+  return { sampled, achievedMean, clamped };
+}
+
+/**
+ * Stratified sample of `k` rows from non-zero `rows`, partitioning by
+ * log(payout). Each bucket contributes a slot count proportional to its size
+ * in the source, so the sample preserves the source's per-bucket population
+ * and (in expectation) its mean payout — critical for RTP fidelity.
  *
  * A simple uniform reservoir over a long-tailed distribution can over-pick
  * tail rows by chance; with weight=W in the output, that drift gets amplified
  * (here observed as +7.6% RTP on real ANTE data). Stratification eliminates
  * that drift.
+ *
+ * Assumes all input rows have payoutCents > 0; the zero-payout rows are
+ * handled separately by `uniformReservoirSample` so the caller can bias the
+ * zero/non-zero ratio per `targetHitRate`.
  */
-function stratifiedSmallSample(
-  smallRows: ReadonlyArray<LookupRow>,
+function stratifiedSmallSampleNonZero(
+  rows: ReadonlyArray<LookupRow>,
   k: number,
   bucketCount: number,
   seed: number,
 ): LookupRow[] {
-  if (k >= smallRows.length) return [...smallRows];
+  if (k >= rows.length) return [...rows];
   if (k <= 0) return [];
 
-  // Find min/max nonzero payout for log bucketing.
-  let minNonzero = Infinity;
+  // Find min/max payout for log bucketing.
+  let minPayout = Infinity;
   let maxPayout = 0;
-  for (const r of smallRows) {
-    if (r.payoutCents > 0 && r.payoutCents < minNonzero) minNonzero = r.payoutCents;
+  for (const r of rows) {
+    if (r.payoutCents > 0 && r.payoutCents < minPayout) minPayout = r.payoutCents;
     if (r.payoutCents > maxPayout) maxPayout = r.payoutCents;
   }
-  const hasNonzero = isFinite(minNonzero) && maxPayout > 0;
+  const usable = isFinite(minPayout) && maxPayout > 0;
 
-  // Partition by payout into a zero bucket + bucketCount log buckets.
   type Bucket = { indices: number[] };
-  const zeroBucket: Bucket = { indices: [] };
   const logBuckets: Bucket[] = Array.from({ length: bucketCount }, () => ({ indices: [] }));
 
-  const logMin = hasNonzero ? Math.log(minNonzero) : 0;
-  const logMax = hasNonzero ? Math.log(maxPayout) : 1;
+  const logMin = usable ? Math.log(minPayout) : 0;
+  const logMax = usable ? Math.log(maxPayout) : 1;
   const logSpan = Math.max(logMax - logMin, 1e-9);
 
-  for (let i = 0; i < smallRows.length; i++) {
-    const r = smallRows[i];
-    if (r.payoutCents === 0) {
-      zeroBucket.indices.push(i);
-      continue;
-    }
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    if (r.payoutCents <= 0) continue; // defensive — caller passes non-zero only
     let bidx = 0;
-    if (hasNonzero && logSpan > 0) {
+    if (usable && logSpan > 0) {
       const t = (Math.log(r.payoutCents) - logMin) / logSpan;
       bidx = Math.min(bucketCount - 1, Math.max(0, Math.floor(t * bucketCount)));
     }
@@ -235,9 +486,9 @@ function stratifiedSmallSample(
   }
 
   // Allocate slots per bucket proportional to bucket size (largest-remainder).
-  const buckets = [zeroBucket, ...logBuckets];
-  const sizes = buckets.map((b) => b.indices.length);
-  const total = smallRows.length;
+  const sizes = logBuckets.map((b) => b.indices.length);
+  const total = sizes.reduce((s, v) => s + v, 0);
+  if (total === 0) return [];
   const proposed = sizes.map((s) => (s / total) * k);
   const floors = proposed.map(Math.floor);
   const used = floors.reduce((s, v) => s + v, 0);
@@ -251,24 +502,40 @@ function stratifiedSmallSample(
       extra--;
     }
   }
-  // Cap each at bucket size (defensive).
   for (let i = 0; i < floors.length; i++) {
     if (floors[i] > sizes[i]) floors[i] = sizes[i];
   }
 
-  // Sample within each bucket — uniform weights (source weight per row = 1).
   const rng = mulberry32(seed);
   const out: LookupRow[] = [];
-  for (let bi = 0; bi < buckets.length; bi++) {
+  for (let bi = 0; bi < logBuckets.length; bi++) {
     const slots = floors[bi];
     if (slots <= 0) continue;
-    const indices = buckets[bi].indices;
+    const indices = logBuckets[bi].indices;
     const weights = new Array(indices.length).fill(1);
     const sampled = weightedReservoirSample(indices, weights, slots, rng);
-    for (const idx of sampled) out.push(smallRows[idx]);
+    for (const idx of sampled) out.push(rows[idx]);
   }
 
   return out;
+}
+
+/**
+ * Uniform reservoir sample of `k` rows from `rows`. Used for the zero-payout
+ * sub-bucket where stratification by payout is meaningless (single value).
+ */
+function uniformReservoirSample(
+  rows: ReadonlyArray<LookupRow>,
+  k: number,
+  seed: number,
+): LookupRow[] {
+  if (k >= rows.length) return [...rows];
+  if (k <= 0) return [];
+  const rng = mulberry32(seed);
+  const indices = rows.map((_, i) => i);
+  const weights = new Array(indices.length).fill(1);
+  const sampled = weightedReservoirSample(indices, weights, k, rng);
+  return sampled.map((idx) => rows[idx]);
 }
 
 function computeStakeReport(

@@ -470,6 +470,86 @@ describe('integration', () => {
     expect(effectiveLargeRate).toBeLessThan(0.005);
   });
 
+  it('17. tiered honors targetHitRate via sample bias', () => {
+    // Source: 5% non-zero, but we'll target 30%
+    const rng = makeRng(17);
+    const rows: LookupRow[] = [];
+    for (let i = 0; i < 100_000; i++) {
+      const u = rng();
+      let p = 0;
+      if (u > 0.95) p = Math.floor(rng() * 1000);     // 5% non-zero
+      if (u > 0.999) p = Math.floor(rng() * 100_000); // 0.1% high
+      rows.push({ sim: i, weight: 1, payoutCents: p });
+    }
+
+    const result = optimizeLookupTable(rows, {
+      targetRTP: 0.5, toleranceRTP: 1.0,
+      targetCV: 5, toleranceCV: 100,
+      targetHitRate: 0.30,                   // target above source 5%
+      toleranceHitRate: 0.05,
+      capMaxWin: 100_000,
+      nRowsOut: 10_000,
+      requireMaxReached: false,
+      algorithm: 'tiered',
+    });
+
+    // achieved hit-rate should be close to target 0.30
+    expect(result.achieved.hitRate).toBeGreaterThan(0.25);
+    expect(result.achieved.hitRate).toBeLessThan(0.35);
+  });
+
+  it('18. tiered emits warning when targetHitRate unreachable', () => {
+    // Source has too few non-zero rows for high target
+    const rows: LookupRow[] = [];
+    for (let i = 0; i < 10_000; i++) {
+      // Only 1% non-zero
+      rows.push({ sim: i, weight: 1, payoutCents: i < 100 ? 1000 : 0 });
+    }
+    const result = optimizeLookupTable(rows, {
+      targetRTP: 0.5, toleranceRTP: 1.0,
+      targetCV: 5, toleranceCV: 100,
+      targetHitRate: 0.50,    // 50% target but only 1% non-zero available
+      toleranceHitRate: 0.05,
+      capMaxWin: 10_000,
+      nRowsOut: 1000,
+      requireMaxReached: false,
+      algorithm: 'tiered',
+    });
+    // Should emit warning about unreachable target
+    expect(result.warnings.some(w => w.includes('non-zero'))).toBe(true);
+  });
+
+  it('19. tiered hits both hitRate AND RTP targets via dual biasing', () => {
+    const rng = makeRng(19);
+    const rows: LookupRow[] = [];
+    for (let i = 0; i < 200_000; i++) {
+      const u = rng();
+      let p = 0;
+      if (u > 0.85) p = Math.floor(rng() * 200);     // small wins
+      if (u > 0.99) p = Math.floor(rng() * 5000);    // mid wins
+      if (u > 0.9999) p = Math.floor(rng() * 50_000); // big
+      rows.push({ sim: i, weight: 1, payoutCents: p });
+    }
+
+    const result = optimizeLookupTable(rows, {
+      targetRTP: 0.96,
+      toleranceRTP: 0.03,         // 3pp tolerance for tier-based (less precise than NNLS)
+      targetCV: 5, toleranceCV: 100,
+      targetHitRate: 0.20,        // bias above source ~15%
+      toleranceHitRate: 0.02,
+      capMaxWin: 50_000,
+      nRowsOut: 10_000,
+      requireMaxReached: false,
+      algorithm: 'tiered',
+    });
+
+    // Both targets met
+    expect(result.achieved.hitRate).toBeGreaterThan(0.17);
+    expect(result.achieved.hitRate).toBeLessThan(0.23);
+    expect(result.achieved.rtp).toBeGreaterThan(0.92);
+    expect(result.achieved.rtp).toBeLessThan(1.00);
+  });
+
   it('16. NNLS algorithm still works via algorithm: "nnls"', () => {
     const rng = makeRng(16);
     const rows: LookupRow[] = [];
