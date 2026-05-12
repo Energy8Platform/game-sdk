@@ -217,6 +217,31 @@ export function buildTieredLookup(
             `${targetMeanNz.toFixed(0)} cents but achieved ${sampleResult.achievedMean.toFixed(0)} cents`,
         );
       }
+
+      // Iterative swap refinement: close residual RTP gap by swapping
+      // boundary rows in/out of the sample. Each swap is a single LookupRow
+      // exchange, so the weight distribution remains exactly intact.
+      const tolerance = Math.max(1, 0.005 * targetSmallNzSumP); // 0.5% relative, floor 1 cent
+      const refined = refineRtpBySwap(
+        outSmallNonZero,
+        srcSmallNonZero,
+        targetSmallNzSumP,
+        tolerance,
+        10000,
+      );
+      outSmallNonZero = refined.rows;
+
+      if (!refined.converged && refined.swaps > 0 && targetSmallNzSumP > 0) {
+        const achievedMean =
+          outSmallNonZero.length > 0 ? refined.achievedSum / outSmallNonZero.length : 0;
+        const targetMean =
+          outSmallNonZero.length > 0 ? targetSmallNzSumP / outSmallNonZero.length : 0;
+        const gap =
+          targetMean > 0 ? (Math.abs(achievedMean - targetMean) / targetMean) * 100 : 0;
+        warnings.push(
+          `RTP refinement did not fully converge after ${refined.swaps} swaps (${gap.toFixed(2)}% gap)`,
+        );
+      }
     } else {
       // No RTP target signal (targetMeanNz <= 0 means cap already exceeds target,
       // or no non-zero slots): fall back to stratified shape-preserving sample.
@@ -432,6 +457,129 @@ function rtpAwareSampleNonZero(
   // If we hit a hard side cap (consumed entire low or entire high group), flag.
   if (nHighOut === high.length || nLowOut === low.length) clamped = true;
   return { sampled, achievedMean, clamped };
+}
+
+/**
+ * Iterative row-level swap refinement to close residual RTP gap.
+ *
+ * The analytical low/high partition in `rtpAwareSampleNonZero` lands within a
+ * few rows of the optimum but `Math.round(nHighOut)` and `Math.round(W)` leak
+ * ~1% of RTP. This function exchanges single rows in/out of the sample to
+ * close the residual Σ-payout gap to the target, without touching the
+ * row count or weight distribution.
+ *
+ * Each swap replaces ONE sample row with ONE outside row, so |sampled|
+ * stays exactly k. Converges in O(K) swaps where K is the initial gap
+ * measured in row-payout units.
+ */
+function refineRtpBySwap(
+  sampled: ReadonlyArray<LookupRow>,
+  pool: ReadonlyArray<LookupRow>,
+  targetSumPayout: number,
+  tolerance: number,
+  maxSwaps: number,
+): { rows: LookupRow[]; achievedSum: number; swaps: number; converged: boolean } {
+  const inSet = new Set<number>();
+  for (const r of sampled) inSet.add(r.sim);
+
+  let achievedSum = 0;
+  for (const r of sampled) achievedSum += r.payoutCents;
+
+  const sampledArr = sampled.slice();
+  const outsideArr: LookupRow[] = [];
+  for (const r of pool) {
+    if (!inSet.has(r.sim)) outsideArr.push(r);
+  }
+  sampledArr.sort((a, b) => a.payoutCents - b.payoutCents); // ascending
+  outsideArr.sort((a, b) => a.payoutCents - b.payoutCents);
+
+  // Binary-search-by-payout helpers on a sorted array.
+  const lowerBound = (arr: ReadonlyArray<LookupRow>, target: number): number => {
+    let lo = 0;
+    let hi = arr.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (arr[mid].payoutCents < target) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  };
+
+  let swaps = 0;
+  let converged = false;
+
+  while (swaps < maxSwaps) {
+    const delta = targetSumPayout - achievedSum;
+    if (Math.abs(delta) <= tolerance) {
+      converged = true;
+      break;
+    }
+
+    if (delta > 0) {
+      // Raise Σ: swap lowest sample OUT for highest outside row whose
+      // payout is ≤ (sampleLow + delta), but > sampleLow.
+      if (sampledArr.length === 0 || outsideArr.length === 0) break;
+      const sampleLow = sampledArr[0];
+      const desired = sampleLow.payoutCents + delta;
+
+      // Largest outside index with payout ≤ desired AND > sampleLow.payoutCents.
+      // Use lowerBound for desired+1 (first > desired) - 1 → last ≤ desired.
+      let bestIdx = lowerBound(outsideArr, desired + 1) - 1;
+      // Constraint: must be strictly greater than sampleLow to improve Σ.
+      if (bestIdx < 0 || outsideArr[bestIdx].payoutCents <= sampleLow.payoutCents) {
+        // No outside row in (sampleLow, sampleLow+delta]. Try the largest
+        // available outside row > sampleLow (would overshoot but reduce |delta|
+        // only if 2 * outsideRow - 2 * sampleLow ≤ delta is false → would
+        // overshoot more than current undershoot; skip).
+        // We strictly require non-overshooting swap → stop.
+        break;
+      }
+      const outsideRow = outsideArr[bestIdx];
+      const newSum = achievedSum + outsideRow.payoutCents - sampleLow.payoutCents;
+
+      // Apply swap: remove sampleLow (front), insert outsideRow sorted into sampledArr.
+      sampledArr.shift();
+      const insertPos = lowerBound(sampledArr, outsideRow.payoutCents);
+      sampledArr.splice(insertPos, 0, outsideRow);
+      // Remove outsideRow from outsideArr, insert sampleLow sorted.
+      outsideArr.splice(bestIdx, 1);
+      const outPos = lowerBound(outsideArr, sampleLow.payoutCents);
+      outsideArr.splice(outPos, 0, sampleLow);
+
+      inSet.delete(sampleLow.sim);
+      inSet.add(outsideRow.sim);
+      achievedSum = newSum;
+    } else {
+      // Lower Σ: swap highest sample OUT for lowest outside row whose
+      // payout is ≥ (sampleHigh - |delta|), but < sampleHigh.
+      if (sampledArr.length === 0 || outsideArr.length === 0) break;
+      const sampleHigh = sampledArr[sampledArr.length - 1];
+      const needLoss = -delta;
+      const desired = sampleHigh.payoutCents - needLoss;
+
+      // Smallest outside index with payout ≥ desired AND < sampleHigh.payoutCents.
+      let bestIdx = lowerBound(outsideArr, desired);
+      if (bestIdx >= outsideArr.length || outsideArr[bestIdx].payoutCents >= sampleHigh.payoutCents) {
+        break;
+      }
+      const outsideRow = outsideArr[bestIdx];
+      const newSum = achievedSum + outsideRow.payoutCents - sampleHigh.payoutCents;
+
+      sampledArr.pop();
+      const insertPos = lowerBound(sampledArr, outsideRow.payoutCents);
+      sampledArr.splice(insertPos, 0, outsideRow);
+      outsideArr.splice(bestIdx, 1);
+      const outPos = lowerBound(outsideArr, sampleHigh.payoutCents);
+      outsideArr.splice(outPos, 0, sampleHigh);
+
+      inSet.delete(sampleHigh.sim);
+      inSet.add(outsideRow.sim);
+      achievedSum = newSum;
+    }
+    swaps++;
+  }
+
+  return { rows: sampledArr, achievedSum, swaps, converged };
 }
 
 /**
