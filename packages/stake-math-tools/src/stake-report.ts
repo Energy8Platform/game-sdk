@@ -9,7 +9,7 @@ import type { LookupRow, OptimizeAchieved, StakeReport, TopKShare, HitRateBucket
  * captures zero-payout rows. All other ranges are `[low, high)` here for
  * consistency; the last entry is `[20000, ∞)`.
  */
-const HIT_RATE_RANGES: ReadonlyArray<readonly [number, number]> = [
+export const HIT_RATE_RANGES: ReadonlyArray<readonly [number, number]> = [
   [0, 0.1],
   [0.1, 1],
   [1, 2],

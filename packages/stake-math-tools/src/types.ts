@@ -75,6 +75,12 @@ export interface OptimizeParams {
   /** Tier-based only: target effective probability for cap+large rows in output.
    *  Default: natural rate from source = (n_cap + n_large) / n_source. */
   largeTarget?: number;
+
+  /** Tier-based only: when true, ensure every Stake hit-rate distribution range
+   *  up to the actual max payout has ≥ 1 output row when source has rows in
+   *  that range. Prevents Stake's "Gaps in the Hit Rate Table" rejection.
+   *  Default true. */
+  ensureRangeCoverage?: boolean;
 }
 
 export interface OptimizeAchieved {

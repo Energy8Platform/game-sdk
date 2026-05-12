@@ -20,7 +20,7 @@ import type {
 } from './types.js';
 import { computeMetrics, isNearMax } from './metrics.js';
 import { mulberry32, weightedReservoirSample } from './sample.js';
-import { computeStakeReport, detectHitRateGaps } from './stake-report.js';
+import { computeStakeReport, detectHitRateGaps, HIT_RATE_RANGES } from './stake-report.js';
 
 const DEFAULTS = {
   betCostCents: 100,
@@ -94,7 +94,9 @@ export function buildTieredLookup(
 
   const slotsForSmall = params.nRowsOut - outCap.length - outLarge.length;
   const warnings: string[] = [];
-  let outSmall: LookupRow[] = [];
+  let outSmallZero: LookupRow[] = [];
+  let outSmallNonZero: LookupRow[] = [];
+  let srcSmallNonZeroAll: ReadonlyArray<LookupRow> = [];
   // Compute W and small-tier subdivision now, so we can do RTP-aware non-zero
   // sampling using the same W used in the output.
   let W = 1;
@@ -109,6 +111,7 @@ export function buildTieredLookup(
       if (r.payoutCents === 0) srcSmallZero.push(r);
       else srcSmallNonZero.push(r);
     }
+    srcSmallNonZeroAll = srcSmallNonZero;
 
     // Target cap rate (cap + large weight share) — same `target` used for W below.
     const target_cap_rate = target;
@@ -162,7 +165,7 @@ export function buildTieredLookup(
 
     const bucketCount = params.bucketCount ?? 100;
     // Sample zero sub-bucket: uniform reservoir.
-    const outSmallZero =
+    outSmallZero =
       nA >= srcSmallZero.length
         ? [...srcSmallZero]
         : uniformReservoirSample(srcSmallZero, nA, seed);
@@ -197,7 +200,6 @@ export function buildTieredLookup(
     const targetSmallNzSumP = W > 0 ? (targetSumWP - capSumP) / W : 0;
     const targetMeanNz = nB > 0 ? targetSmallNzSumP / nB : 0;
 
-    let outSmallNonZero: LookupRow[];
     if (nB >= srcSmallNonZero.length) {
       outSmallNonZero = [...srcSmallNonZero];
     } else if (nB > 0 && targetMeanNz > 0) {
@@ -332,8 +334,34 @@ export function buildTieredLookup(
       }
     }
 
-    outSmall = [...outSmallZero, ...outSmallNonZero];
   }
+
+  // Phase 4b: gap-filling pass — ensure no intermediate gaps in the Stake
+  // hit-rate distribution. Stake's "Gaps in the Hit Rate Table" check
+  // rejects publishing tables with empty ranges sandwiched between non-empty
+  // ones. The earlier stratified/RTP-aware sampling can leave a small but
+  // non-empty source range with 0 output slots after largest-remainder
+  // allocation; this pass swaps in a source row from any such missing range.
+  //
+  // Range occupancy is counted across ALL output rows (cap + large + small),
+  // so a range filled by cap/large rows is NOT considered a gap. Swaps only
+  // happen within the small-non-zero tier (where we have flexibility).
+  const ensureRangeCoverage = params.ensureRangeCoverage ?? true;
+  if (ensureRangeCoverage && outSmallNonZero.length > 0) {
+    // Sort by payout ascending for the range-scan inside fillStakeRangeGaps.
+    outSmallNonZero.sort((a, b) => a.payoutCents - b.payoutCents);
+    const otherOutRows: LookupRow[] = [...outCap, ...outLarge];
+    fillStakeRangeGaps(
+      outSmallNonZero,
+      srcSmallNonZeroAll,
+      otherOutRows,
+      sourceMetrics.maxPayout,
+      betCost,
+      warnings,
+    );
+  }
+
+  const outSmall: LookupRow[] = [...outSmallZero, ...outSmallNonZero];
 
   // Phase 5: compute W (recompute to match actual nSmall after sampling)
   const nHigh = outCap.length + outLarge.length;
@@ -1003,5 +1031,164 @@ function uniformReservoirSample(
   const weights = new Array(indices.length).fill(1);
   const sampled = weightedReservoirSample(indices, weights, k, rng);
   return sampled.map((idx) => rows[idx]);
+}
+
+/**
+ * Find the index of the Stake hit-rate range that `payoutCents` falls into.
+ * Returns -1 if no range matches (shouldn't happen given the [0, 0.1] +
+ * [20000, ∞) coverage, but defensive).
+ */
+function findRange(payoutCents: number, betCostCents: number): number {
+  const pm = payoutCents / betCostCents;
+  for (let i = 0; i < HIT_RATE_RANGES.length; i++) {
+    const [low, high] = HIT_RATE_RANGES[i];
+    if (pm >= low && pm < high) return i;
+  }
+  return -1;
+}
+
+/**
+ * Fourth refinement pass: ensure no intermediate gaps in the Stake hit-rate
+ * distribution table. Stake rejects publishing tables with empty ranges
+ * sandwiched between non-empty ones ("Gaps in the Hit Rate Table" check).
+ *
+ * Algorithm: for each range below maxPayout that's empty in output, find a
+ * source row in that range and swap it in by replacing an output row whose
+ * payout is closest (minimizes Σ payout drift). Skips ranges where source
+ * has no rows (impossible to fill — emit a one-time warning).
+ *
+ * Modifies `outSmallNonZero` in place (preserves sorted-by-payout-ascending
+ * invariant). Returns number of swaps applied plus the number of ranges that
+ * source couldn't fill.
+ *
+ * Performance: O(R × (N + |source|)) where R = 16 ranges; the rangeCount/
+ * rangeIdx maps avoid the naive O(N²) inner range-count.
+ */
+function fillStakeRangeGaps(
+  outSmallNonZero: LookupRow[],
+  srcSmallNonZero: ReadonlyArray<LookupRow>,
+  otherOutRows: ReadonlyArray<LookupRow>,
+  maxPayoutCents: number,
+  betCostCents: number,
+  warnings: string[],
+): { swapsApplied: number; unfillable: number } {
+  let swapsApplied = 0;
+  let unfillable = 0;
+
+  // Build set of in-sample sim ids for fast membership tests.
+  const inSample = new Set<number>();
+  for (const r of outSmallNonZero) inSample.add(r.sim);
+
+  // Pre-compute per-row range index for the swappable tier (small non-zero).
+  const rangeIdx: number[] = outSmallNonZero.map((r) =>
+    findRange(r.payoutCents, betCostCents),
+  );
+  // Range counts over the FULL output (small + cap/large): a range filled by
+  // cap/large rows is not a gap, even if small-tier alone has 0 in it.
+  const rangeCount = new Map<number, number>();
+  for (const idx of rangeIdx) rangeCount.set(idx, (rangeCount.get(idx) ?? 0) + 1);
+  for (const r of otherOutRows) {
+    const idx = findRange(r.payoutCents, betCostCents);
+    rangeCount.set(idx, (rangeCount.get(idx) ?? 0) + 1);
+  }
+
+  // Only consider Stake ranges whose lower bound is below maxPayout (in bet units).
+  const maxPm = maxPayoutCents / betCostCents;
+
+  for (let rangeI = 0; rangeI < HIT_RATE_RANGES.length; rangeI++) {
+    const [low, high] = HIT_RATE_RANGES[rangeI];
+    if (low >= maxPm) break; // tail ranges above maxPayout — natural empty
+    const lowCents = low * betCostCents;
+    const highCents = high === Infinity ? Infinity : high * betCostCents;
+
+    // Skip the [0, 0.1) range — that's the zero-tier territory (payouts < 0.1
+    // bet units, i.e. 0 cents at betCost=100). Zero-payouts are handled by the
+    // zero sub-bucket; we don't fill via non-zero rows here.
+    if (low === 0) continue;
+
+    // Skip if already populated.
+    if ((rangeCount.get(rangeI) ?? 0) >= 1) continue;
+
+    // Find source rows in this range that aren't already in sample.
+    const sourceCandidates: LookupRow[] = [];
+    for (const r of srcSmallNonZero) {
+      if (r.payoutCents >= lowCents && r.payoutCents < highCents && !inSample.has(r.sim)) {
+        sourceCandidates.push(r);
+      }
+    }
+    if (sourceCandidates.length === 0) {
+      unfillable++;
+      const rangeStr =
+        high === Infinity ? `[${low}, infinity)` : `[${low}, ${high})`;
+      warnings.push(
+        `gap in hit-rate range ${rangeStr}x bet: source has no rows in this payout-multiplier range`,
+      );
+      continue;
+    }
+
+    // Pick source row closest to range geometric mid so any subsequent
+    // statistic sliding remains balanced.
+    const midPayout =
+      high === Infinity
+        ? Math.max(lowCents, maxPayoutCents)
+        : Math.sqrt(lowCents * highCents);
+    let swapInRow = sourceCandidates[0];
+    let bestDist = Math.abs(swapInRow.payoutCents - midPayout);
+    for (const r of sourceCandidates) {
+      const d = Math.abs(r.payoutCents - midPayout);
+      if (d < bestDist) {
+        swapInRow = r;
+        bestDist = d;
+      }
+    }
+
+    // Pick output row to remove: payout closest to swapInRow.payoutCents so
+    // Σ-payout drift (i.e. RTP impact) is minimized. Skip any row whose
+    // removal would empty another range.
+    let removeIdx = -1;
+    let removeDist = Infinity;
+    for (let i = 0; i < outSmallNonZero.length; i++) {
+      if ((rangeCount.get(rangeIdx[i]) ?? 0) <= 1) continue; // protect other ranges
+      const r = outSmallNonZero[i];
+      const d = Math.abs(r.payoutCents - swapInRow.payoutCents);
+      if (d < removeDist) {
+        removeDist = d;
+        removeIdx = i;
+      }
+    }
+    if (removeIdx < 0) {
+      // No safe removal candidate — every range has exactly 1 row. Skip
+      // this gap rather than break other ranges.
+      unfillable++;
+      continue;
+    }
+
+    // Apply the swap.
+    const removedRow = outSmallNonZero[removeIdx];
+    const removedRangeIdx = rangeIdx[removeIdx];
+    inSample.delete(removedRow.sim);
+    inSample.add(swapInRow.sim);
+    // Remove the old row, then re-insert swapInRow at the correct sorted
+    // position to preserve the ascending invariant. Also update rangeIdx
+    // and rangeCount.
+    outSmallNonZero.splice(removeIdx, 1);
+    rangeIdx.splice(removeIdx, 1);
+    rangeCount.set(removedRangeIdx, (rangeCount.get(removedRangeIdx) ?? 1) - 1);
+
+    let insertPos = 0;
+    while (
+      insertPos < outSmallNonZero.length &&
+      outSmallNonZero[insertPos].payoutCents < swapInRow.payoutCents
+    ) {
+      insertPos++;
+    }
+    outSmallNonZero.splice(insertPos, 0, swapInRow);
+    rangeIdx.splice(insertPos, 0, rangeI);
+    rangeCount.set(rangeI, (rangeCount.get(rangeI) ?? 0) + 1);
+
+    swapsApplied++;
+  }
+
+  return { swapsApplied, unfillable };
 }
 

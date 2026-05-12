@@ -282,6 +282,10 @@ describe('integration', () => {
     }
 
     // With betCostCents = 100, max payout 5000 → payoutMultMax = 50
+    // (Disable gap-fill so the output is strictly determined by sampling +
+    // refinement; gap-fill behavior depends on betCost via the Stake range
+    // boundaries, which would break the betCost-proportionality check on
+    // baseStd below.)
     const r1 = optimizeLookupTable(rows, {
       targetRTP: 0.1, toleranceRTP: 0.5,
       targetCV: 3, toleranceCV: 100,
@@ -291,6 +295,7 @@ describe('integration', () => {
       requireMaxReached: false,
       maxIterations: 1,
       betCostCents: 100,
+      ensureRangeCoverage: false,
     });
     expect(r1.stakeReport.payoutMultMax).toBeCloseTo(r1.achieved.maxPayout / 100, 6);
 
@@ -304,6 +309,7 @@ describe('integration', () => {
       requireMaxReached: false,
       maxIterations: 1,
       betCostCents: 200,
+      ensureRangeCoverage: false,
     });
     expect(r2.stakeReport.payoutMultMax).toBeCloseTo(r2.achieved.maxPayout / 200, 6);
     expect(r2.stakeReport.baseStd).toBeCloseTo(r1.stakeReport.baseStd / 2, 5);
@@ -571,5 +577,60 @@ describe('integration', () => {
     // NNLS produces valid output
     expect(result.rows).toHaveLength(500);
     expect(result.stakeReport).toBeDefined();
+  });
+
+  it('20. tiered fills intermediate hit-rate distribution gaps when source has rows', () => {
+    // Construct source where natural stratified sampling would likely miss a range:
+    // many rows in [0, ~2)x bet, one row in [100, 200)x bet, no rows above.
+    const rows: LookupRow[] = [];
+    for (let i = 0; i < 50_000; i++) rows.push({ sim: i, weight: 1, payoutCents: 0 });
+    for (let i = 50_000; i < 60_000; i++) {
+      rows.push({ sim: i, weight: 1, payoutCents: 100 + (i % 100) }); // pm in [1, 2)
+    }
+    // Single row in [100, 200) — sampler must keep it to avoid creating a gap.
+    rows.push({ sim: 99999, weight: 1, payoutCents: 15000 }); // pm 150
+
+    const result = optimizeLookupTable(rows, {
+      targetRTP: 0.05, toleranceRTP: 1.0,
+      targetCV: 3, toleranceCV: 100,
+      targetHitRate: 0.2, toleranceHitRate: 0.5,
+      capMaxWin: 100_000,
+      nRowsOut: 1000,
+      requireMaxReached: false,
+      algorithm: 'tiered',
+    });
+
+    // The [100, 200) range should have ≥ 1 row in output (source has it).
+    const bucket = result.stakeReport.hitRateDistribution.find(
+      (b) => b.low === 100 && b.high === 200,
+    );
+    expect(bucket?.count).toBeGreaterThanOrEqual(1);
+  });
+
+  it('21. tiered warns when a range is unfillable (no source rows)', () => {
+    // Source has rows in [0.5, 1)x bet and a high cluster around 15000x bet,
+    // nothing in between. The intermediate ranges [1, 10000) are unfillable.
+    const rows: LookupRow[] = [];
+    for (let i = 0; i < 50_000; i++) rows.push({ sim: i, weight: 1, payoutCents: 0 });
+    for (let i = 50_000; i < 51_000; i++) {
+      rows.push({ sim: i, weight: 1, payoutCents: 50 }); // pm 0.5
+    }
+    for (let i = 51_000; i < 51_010; i++) {
+      rows.push({ sim: i, weight: 1, payoutCents: 1_500_000 }); // pm 15000
+    }
+
+    const result = optimizeLookupTable(rows, {
+      targetRTP: 1.0, toleranceRTP: 1.0,
+      targetCV: 3, toleranceCV: 100,
+      targetHitRate: 0.2, toleranceHitRate: 0.5,
+      capMaxWin: 1_500_000,
+      nRowsOut: 500,
+      requireMaxReached: false,
+      algorithm: 'tiered',
+    });
+
+    // Should emit a warning about an unfillable gap.
+    const gapWarning = result.warnings.find((w) => w.includes('source has no rows'));
+    expect(gapWarning).toBeDefined();
   });
 });
