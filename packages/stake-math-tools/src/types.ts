@@ -102,6 +102,17 @@ export interface TopKShare {
   share: number;
 }
 
+export interface HitRateBucket {
+  /** Inclusive lower bound of the payout-multiplier range. */
+  low: number;
+  /** Exclusive upper bound (Infinity for the open top bucket). */
+  high: number;
+  /** Number of distinct output rows with pm in [low, high). */
+  count: number;
+  /** Σ weight in this range / Σ weight total — the player-facing probability. */
+  effectiveHitRate: number;
+}
+
 export interface StakeReport {
   /** Maximum payout in the output, as a bet multiplier (payoutCents / betCostCents). */
   payoutMultMax: number;
@@ -119,6 +130,17 @@ export interface StakeReport {
   /** Top-K cumulative RTP shares, sorted by per-row (w × payout) descending.
    *  Standard K values reported: 1, 5, 10, 100. */
   topKShare: TopKShare[];
+
+  /** Stake's hit-rate-distribution table: payout-multiplier ranges with row count
+   *  and effective probability. Ranges are: [0, 0.1), [0.1, 1), [1, 2), [2, 5),
+   *  [5, 10), [10, 20), [20, 50), [50, 100), [100, 200), [200, 500), [500, 1000),
+   *  [1000, 2000), [2000, 5000), [5000, 10000), [10000, 20000), [20000, ∞).
+   *  Stake fails publication when any intermediate range is empty (gap). */
+  hitRateDistribution: HitRateBucket[];
+
+  /** Number of distinct payoutCents values in the output. Stake flags "Insufficient
+   *  Unique Events" when this is too low — same outcomes repeat in a session. */
+  uniqueEvents: number;
 
   /** Bet cost in cents used for the multiplier conversions (echoed from params). */
   betCostCents: number;

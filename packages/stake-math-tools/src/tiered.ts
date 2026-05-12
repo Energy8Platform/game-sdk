@@ -16,13 +16,11 @@ import type {
   LookupRow,
   OptimizeParams,
   OptimizeResult,
-  OptimizeAchieved,
   ToleranceMet,
-  StakeReport,
-  TopKShare,
 } from './types.js';
 import { computeMetrics, isNearMax } from './metrics.js';
 import { mulberry32, weightedReservoirSample } from './sample.js';
+import { computeStakeReport, detectHitRateGaps } from './stake-report.js';
 
 const DEFAULTS = {
   betCostCents: 100,
@@ -396,6 +394,17 @@ export function buildTieredLookup(
   if (sourceMetrics.maxPayout < maxReachedFraction * params.capMaxWin && requireMaxReached) {
     warnings.push(
       `no row reaches ${maxReachedFraction * 100}% of capMaxWin; requireMaxReached cannot be honored`,
+    );
+  }
+
+  // Warn about intermediate gaps in the hit-rate distribution (Stake's
+  // "Gaps in the Hit Rate Table" check). Empty ranges above the highest
+  // non-empty range are natural and not flagged.
+  const gaps = detectHitRateGaps(stakeReport.hitRateDistribution);
+  if (gaps.length > 0) {
+    const formatted = gaps.map((g) => `[${g.low}, ${g.high})`).join(', ');
+    warnings.push(
+      `hit-rate distribution has ${gaps.length} intermediate gap(s) — Stake "Gaps in the Hit Rate Table" check may fail: ${formatted}`,
     );
   }
 
@@ -996,52 +1005,3 @@ function uniformReservoirSample(
   return sampled.map((idx) => rows[idx]);
 }
 
-function computeStakeReport(
-  rows: ReadonlyArray<LookupRow>,
-  achieved: OptimizeAchieved,
-  betCostCents: number,
-): StakeReport {
-  const threshold5K = 5000 * betCostCents;
-  const threshold10K = 10000 * betCostCents;
-  let w5K = 0n,
-    w10K = 0n,
-    wTotal = 0n;
-  for (const r of rows) {
-    const w = BigInt(r.weight);
-    wTotal += w;
-    if (r.payoutCents >= threshold5K) w5K += w;
-    if (r.payoutCents >= threshold10K) w10K += w;
-  }
-  const prob5K = wTotal > 0n ? Number(w5K) / Number(wTotal) : 0;
-  const prob10K = wTotal > 0n ? Number(w10K) / Number(wTotal) : 0;
-
-  const wpEntries = rows.map((r) => r.weight * r.payoutCents);
-  let totalWP = 0;
-  for (const v of wpEntries) totalWP += v;
-  const sortedWP = wpEntries.slice().sort((a, b) => b - a);
-  const topKShare: TopKShare[] = [];
-  const Ks = [1, 5, 10, 100];
-  let cum = 0;
-  let k = 0;
-  for (let i = 0; i < sortedWP.length; i++) {
-    cum += sortedWP[i];
-    while (k < Ks.length && i + 1 === Ks[k]) {
-      topKShare.push({ k: Ks[k], share: totalWP > 0 ? cum / totalWP : 0 });
-      k++;
-    }
-    if (k >= Ks.length) break;
-  }
-  while (k < Ks.length) {
-    topKShare.push({ k: Ks[k], share: totalWP > 0 ? cum / totalWP : 0 });
-    k++;
-  }
-
-  return {
-    payoutMultMax: achieved.maxPayout / betCostCents,
-    baseStd: (achieved.cv * achieved.rtp * 100) / betCostCents,
-    prob5K,
-    prob10K,
-    topKShare,
-    betCostCents,
-  };
-}

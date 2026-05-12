@@ -9,7 +9,9 @@ export type {
   ToleranceMet,
   StakeReport,
   TopKShare,
+  HitRateBucket,
 } from './types.js';
+export { computeStakeReport, detectHitRateGaps } from './stake-report.js';
 
 // Lower-level pieces — exposed so callers can build alternative pipelines or test in isolation.
 export { computeMetrics, isNearMax } from './metrics.js';
