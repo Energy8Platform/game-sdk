@@ -22,7 +22,7 @@ import type {
   TopKShare,
 } from './types.js';
 import { computeMetrics, isNearMax } from './metrics.js';
-import { mulberry32 } from './sample.js';
+import { mulberry32, weightedReservoirSample } from './sample.js';
 
 const DEFAULTS = {
   betCostCents: 100,
@@ -100,8 +100,10 @@ export function buildTieredLookup(
     if (slotsForSmall >= srcSmall.length) {
       outSmall = srcSmall;
     } else {
-      // Random sample (deterministic with seed)
-      outSmall = reservoirSample(srcSmall, slotsForSmall, mulberry32(seed));
+      // Stratified sample by log(payout) to preserve source distribution shape
+      // (uniform reservoir over-represents long tails → RTP drift).
+      const bucketCount = params.bucketCount ?? 100;
+      outSmall = stratifiedSmallSample(srcSmall, slotsForSmall, bucketCount, seed);
     }
   }
 
@@ -180,16 +182,92 @@ export function buildTieredLookup(
   };
 }
 
-function reservoirSample<T>(items: ReadonlyArray<T>, k: number, rng: () => number): T[] {
-  const out: T[] = [];
-  for (let i = 0; i < items.length; i++) {
-    if (i < k) {
-      out.push(items[i]);
-    } else {
-      const j = Math.floor(rng() * (i + 1));
-      if (j < k) out[j] = items[i];
+/**
+ * Stratified sample of `k` rows from `smallRows`, partitioning by log(payout).
+ * Each bucket contributes a slot count proportional to its size in the source,
+ * so the sample preserves the source's per-bucket population and (in
+ * expectation) the source's mean payout — which is critical for RTP fidelity.
+ *
+ * A simple uniform reservoir over a long-tailed distribution can over-pick
+ * tail rows by chance; with weight=W in the output, that drift gets amplified
+ * (here observed as +7.6% RTP on real ANTE data). Stratification eliminates
+ * that drift.
+ */
+function stratifiedSmallSample(
+  smallRows: ReadonlyArray<LookupRow>,
+  k: number,
+  bucketCount: number,
+  seed: number,
+): LookupRow[] {
+  if (k >= smallRows.length) return [...smallRows];
+  if (k <= 0) return [];
+
+  // Find min/max nonzero payout for log bucketing.
+  let minNonzero = Infinity;
+  let maxPayout = 0;
+  for (const r of smallRows) {
+    if (r.payoutCents > 0 && r.payoutCents < minNonzero) minNonzero = r.payoutCents;
+    if (r.payoutCents > maxPayout) maxPayout = r.payoutCents;
+  }
+  const hasNonzero = isFinite(minNonzero) && maxPayout > 0;
+
+  // Partition by payout into a zero bucket + bucketCount log buckets.
+  type Bucket = { indices: number[] };
+  const zeroBucket: Bucket = { indices: [] };
+  const logBuckets: Bucket[] = Array.from({ length: bucketCount }, () => ({ indices: [] }));
+
+  const logMin = hasNonzero ? Math.log(minNonzero) : 0;
+  const logMax = hasNonzero ? Math.log(maxPayout) : 1;
+  const logSpan = Math.max(logMax - logMin, 1e-9);
+
+  for (let i = 0; i < smallRows.length; i++) {
+    const r = smallRows[i];
+    if (r.payoutCents === 0) {
+      zeroBucket.indices.push(i);
+      continue;
+    }
+    let bidx = 0;
+    if (hasNonzero && logSpan > 0) {
+      const t = (Math.log(r.payoutCents) - logMin) / logSpan;
+      bidx = Math.min(bucketCount - 1, Math.max(0, Math.floor(t * bucketCount)));
+    }
+    logBuckets[bidx].indices.push(i);
+  }
+
+  // Allocate slots per bucket proportional to bucket size (largest-remainder).
+  const buckets = [zeroBucket, ...logBuckets];
+  const sizes = buckets.map((b) => b.indices.length);
+  const total = smallRows.length;
+  const proposed = sizes.map((s) => (s / total) * k);
+  const floors = proposed.map(Math.floor);
+  const used = floors.reduce((s, v) => s + v, 0);
+  const remainders = proposed.map((p, i) => p - floors[i]);
+  const order = remainders.map((_, i) => i).sort((a, b) => remainders[b] - remainders[a]);
+  let extra = k - used;
+  for (const i of order) {
+    if (extra === 0) break;
+    if (floors[i] < sizes[i]) {
+      floors[i]++;
+      extra--;
     }
   }
+  // Cap each at bucket size (defensive).
+  for (let i = 0; i < floors.length; i++) {
+    if (floors[i] > sizes[i]) floors[i] = sizes[i];
+  }
+
+  // Sample within each bucket — uniform weights (source weight per row = 1).
+  const rng = mulberry32(seed);
+  const out: LookupRow[] = [];
+  for (let bi = 0; bi < buckets.length; bi++) {
+    const slots = floors[bi];
+    if (slots <= 0) continue;
+    const indices = buckets[bi].indices;
+    const weights = new Array(indices.length).fill(1);
+    const sampled = weightedReservoirSample(indices, weights, slots, rng);
+    for (const idx of sampled) out.push(smallRows[idx]);
+  }
+
   return out;
 }
 
