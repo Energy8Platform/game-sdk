@@ -222,6 +222,86 @@ describe('integration', () => {
     expect(result.warnings.find(w => w.includes('maxRowRtpShare'))).toBeUndefined();
   });
 
+  it('10. stakeReport — basic metrics and topKShare structure', () => {
+    // Simple input: 1000 rows, mix of zero/small/large payouts
+    const rng = makeRng(10);
+    const rows: LookupRow[] = [];
+    for (let i = 0; i < 5000; i++) {
+      let p = 0;
+      const u = rng();
+      if (u > 0.7) p = Math.floor(rng() * 1000);
+      if (u > 0.97) p = Math.floor(rng() * 50_000);
+      rows.push({ sim: i, weight: 1 + Math.floor(rng() * 100), payoutCents: p });
+    }
+
+    const result = optimizeLookupTable(rows, {
+      targetRTP: 0.5, toleranceRTP: 0.2,
+      targetCV: 3, toleranceCV: 5,
+      targetHitRate: 0.3, toleranceHitRate: 0.1,
+      capMaxWin: 50_000,
+      nRowsOut: 500,
+      requireMaxReached: false,
+      maxIterations: 1,
+    });
+
+    expect(result.stakeReport).toBeDefined();
+    expect(result.stakeReport.betCostCents).toBe(100); // default
+    expect(result.stakeReport.payoutMultMax).toBeCloseTo(result.achieved.maxPayout / 100, 6);
+    expect(result.stakeReport.baseStd).toBeGreaterThanOrEqual(0);
+    expect(result.stakeReport.prob5K).toBeGreaterThanOrEqual(0);
+    expect(result.stakeReport.prob5K).toBeLessThanOrEqual(1);
+    expect(result.stakeReport.prob10K).toBeLessThanOrEqual(result.stakeReport.prob5K);
+
+    // topKShare should have entries for K=1, 5, 10, 100
+    expect(result.stakeReport.topKShare.map(t => t.k)).toEqual([1, 5, 10, 100]);
+    // Monotonically non-decreasing
+    for (let i = 1; i < result.stakeReport.topKShare.length; i++) {
+      expect(result.stakeReport.topKShare[i].share).toBeGreaterThanOrEqual(
+        result.stakeReport.topKShare[i - 1].share,
+      );
+    }
+    // Top-1 share matches maxRowRtpShare exactly
+    expect(result.stakeReport.topKShare[0].share).toBeCloseTo(result.maxRowRtpShare, 6);
+  });
+
+  it('11. stakeReport — respects betCostCents parameter', () => {
+    const rows: LookupRow[] = [];
+    for (let i = 0; i < 2000; i++) {
+      rows.push({
+        sim: i,
+        weight: 10,
+        payoutCents: i % 5 === 0 ? Math.floor(Math.random() * 5000) : 0,
+      });
+    }
+
+    // With betCostCents = 100, max payout 5000 → payoutMultMax = 50
+    const r1 = optimizeLookupTable(rows, {
+      targetRTP: 0.1, toleranceRTP: 0.5,
+      targetCV: 3, toleranceCV: 100,
+      targetHitRate: 0.2, toleranceHitRate: 0.5,
+      capMaxWin: 5000,
+      nRowsOut: 200,
+      requireMaxReached: false,
+      maxIterations: 1,
+      betCostCents: 100,
+    });
+    expect(r1.stakeReport.payoutMultMax).toBeCloseTo(r1.achieved.maxPayout / 100, 6);
+
+    // With betCostCents = 200, multipliers halve
+    const r2 = optimizeLookupTable(rows, {
+      targetRTP: 0.1, toleranceRTP: 0.5,
+      targetCV: 3, toleranceCV: 100,
+      targetHitRate: 0.2, toleranceHitRate: 0.5,
+      capMaxWin: 5000,
+      nRowsOut: 200,
+      requireMaxReached: false,
+      maxIterations: 1,
+      betCostCents: 200,
+    });
+    expect(r2.stakeReport.payoutMultMax).toBeCloseTo(r2.achieved.maxPayout / 200, 6);
+    expect(r2.stakeReport.baseStd).toBeCloseTo(r1.stakeReport.baseStd / 2, 5);
+  });
+
   it('6. handles nRowsOut=5000 without n² memory blowup', () => {
     // Pre-fix this would allocate a 5000×5000 dense matrix (200 MB Float64);
     // after the implicit-Tikhonov fix it should fit in well under 100 MB and

@@ -5,6 +5,8 @@ import type {
   OptimizeResult,
   OptimizeAchieved,
   ToleranceMet,
+  StakeReport,
+  TopKShare,
 } from './types.js';
 import { computeMetrics, isNearMax } from './metrics.js';
 import { bucketize } from './bucketize.js';
@@ -21,7 +23,61 @@ const DEFAULTS = {
   bucketCount: 100,
   minPerBucket: 3,
   maxRowRtpShare: 0.05,
+  betCostCents: 100,
 };
+
+function computeStakeReport(
+  outRows: LookupRow[],
+  achieved: OptimizeAchieved,
+  betCostCents: number,
+): StakeReport {
+  const threshold5K = 5000 * betCostCents;
+  const threshold10K = 10000 * betCostCents;
+  let w5K = 0n, w10K = 0n, wTotal = 0n;
+  for (const r of outRows) {
+    const w = BigInt(r.weight);
+    wTotal += w;
+    if (r.payoutCents >= threshold5K) w5K += w;
+    if (r.payoutCents >= threshold10K) w10K += w;
+  }
+  const prob5K = wTotal > 0n ? Number(w5K) / Number(wTotal) : 0;
+  const prob10K = wTotal > 0n ? Number(w10K) / Number(wTotal) : 0;
+
+  // Top-K RTP shares
+  const wpEntries: number[] = outRows.map((r) => r.weight * r.payoutCents);
+  let totalWP = 0;
+  for (const v of wpEntries) totalWP += v;
+  const sortedWP = wpEntries.slice().sort((a, b) => b - a);
+  const topKShare: TopKShare[] = [];
+  const Ks = [1, 5, 10, 100];
+  let cum = 0;
+  let k = 0;
+  for (let i = 0; i < sortedWP.length; i++) {
+    cum += sortedWP[i];
+    while (k < Ks.length && i + 1 === Ks[k]) {
+      topKShare.push({ k: Ks[k], share: totalWP > 0 ? cum / totalWP : 0 });
+      k++;
+    }
+    if (k >= Ks.length) break;
+  }
+  // If output has fewer than max K, pad
+  while (k < Ks.length) {
+    topKShare.push({ k: Ks[k], share: totalWP > 0 ? cum / totalWP : 0 });
+    k++;
+  }
+
+  const payoutMultMax = achieved.maxPayout / betCostCents;
+  const baseStd = (achieved.cv * achieved.rtp * 100) / betCostCents;
+
+  return {
+    payoutMultMax,
+    baseStd,
+    prob5K,
+    prob10K,
+    topKShare,
+    betCostCents,
+  };
+}
 
 export function optimizeLookupTable(
   rowsIn: Iterable<LookupRow>,
@@ -35,6 +91,7 @@ export function optimizeLookupTable(
   const bucketCount = params.bucketCount ?? DEFAULTS.bucketCount;
   let minPerBucket = params.minPerBucket ?? DEFAULTS.minPerBucket;
   const maxRowRtpShare = params.maxRowRtpShare ?? DEFAULTS.maxRowRtpShare;
+  const betCostCents = params.betCostCents ?? DEFAULTS.betCostCents;
 
   const warnings: string[] = [];
 
@@ -322,6 +379,7 @@ export function optimizeLookupTable(
         toleranceMet,
         maxRowRtpShare: maxRowShare,
         warnings: iterWarnings,
+        stakeReport: computeStakeReport(outRows, achieved, betCostCents),
       };
     }
   }
@@ -360,5 +418,6 @@ export function optimizeLookupTable(
     toleranceMet: best.toleranceMet,
     maxRowRtpShare: best.maxRowShare,
     warnings,
+    stakeReport: computeStakeReport(best.rows, best.achieved, betCostCents),
   };
 }

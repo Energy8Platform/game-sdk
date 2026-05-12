@@ -20,6 +20,10 @@ export interface OptimizeParams {
   /** Hard cap. Rows with payoutCents > capMaxWin are dropped. */
   capMaxWin: number;
 
+  /** Cost of a single bet in cents. Used to convert payouts to "bet multiplier" units
+   *  for the Stake-style report. Default 100 (1.0 bet = 100 cents). */
+  betCostCents?: number;
+
   /** When true, force ≥ 1 row with payoutCents ≥ maxReachedFraction × capMaxWin. Default true. */
   requireMaxReached?: boolean;
   /** Default 0.95. */
@@ -62,6 +66,34 @@ export interface ToleranceMet {
   rtpConcentration: boolean;
 }
 
+export interface TopKShare {
+  /** Cumulative share of total RTP coming from the top-K rows (ordered by w·payout descending). */
+  k: number;
+  share: number;
+}
+
+export interface StakeReport {
+  /** Maximum payout in the output, as a bet multiplier (payoutCents / betCostCents). */
+  payoutMultMax: number;
+
+  /** Standard deviation of payouts in bet-cost units (= stddev_payout_cents / betCostCents).
+   *  Equivalent to cv × rtp × (100 / betCostCents). For bet=100 cents, equals cv × rtp × 1. */
+  baseStd: number;
+
+  /** Probability that a sampled spin pays ≥ 5000 × betCost. */
+  prob5K: number;
+
+  /** Probability that a sampled spin pays ≥ 10000 × betCost. */
+  prob10K: number;
+
+  /** Top-K cumulative RTP shares, sorted by per-row (w × payout) descending.
+   *  Standard K values reported: 1, 5, 10, 100. */
+  topKShare: TopKShare[];
+
+  /** Bet cost in cents used for the multiplier conversions (echoed from params). */
+  betCostCents: number;
+}
+
 export interface OptimizeResult {
   rows: LookupRow[];
   achieved: OptimizeAchieved;
@@ -69,4 +101,5 @@ export interface OptimizeResult {
   /** The single output row's largest fraction of total RTP. */
   maxRowRtpShare: number;
   warnings: string[];
+  stakeReport: StakeReport;
 }

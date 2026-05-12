@@ -6,6 +6,8 @@ export type {
   OptimizeResult,
   OptimizeAchieved,
   ToleranceMet,
+  StakeReport,
+  TopKShare,
 } from './types.js';
 
 // Lower-level pieces — exposed so callers can build alternative pipelines or test in isolation.
