@@ -152,6 +152,17 @@ export interface StakeReport {
   betCostCents: number;
 }
 
+export interface RefinementStats {
+  /** Single-row swaps applied during refineRtpBySwap to close residual RTP gap. */
+  rtpSwaps: number;
+  /** Σ-preserving 2-swaps applied during refineCvBySwap to nudge CV. */
+  cvSwaps: number;
+  /** Swaps applied to fill empty Stake distribution ranges (ensureRangeCoverage). */
+  gapFillSwaps: number;
+  /** Stake distribution ranges where source has no rows — gaps that cannot be filled. */
+  gapsUnfillable: number;
+}
+
 export interface OptimizeResult {
   rows: LookupRow[];
   achieved: OptimizeAchieved;
@@ -160,6 +171,8 @@ export interface OptimizeResult {
   maxRowRtpShare: number;
   /** Maximum integer weight observed in output, as a multiple of uniform prior. */
   maxWeightRatio: number;
+  /** Per-pass swap counters from the refinement loops. */
+  refinement: RefinementStats;
   warnings: string[];
   stakeReport: StakeReport;
 }

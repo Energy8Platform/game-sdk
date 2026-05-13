@@ -10,6 +10,7 @@ export type {
   StakeReport,
   TopKShare,
   HitRateBucket,
+  RefinementStats,
 } from './types.js';
 export { computeStakeReport, detectHitRateGaps } from './stake-report.js';
 

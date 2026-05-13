@@ -97,6 +97,11 @@ export function buildTieredLookup(
   let outSmallZero: LookupRow[] = [];
   let outSmallNonZero: LookupRow[] = [];
   let srcSmallNonZeroAll: ReadonlyArray<LookupRow> = [];
+  // Refinement-pass swap counters.
+  let rtpSwaps = 0;
+  let cvSwaps = 0;
+  let gapFillSwaps = 0;
+  let gapsUnfillable = 0;
   // Compute W and small-tier subdivision now, so we can do RTP-aware non-zero
   // sampling using the same W used in the output.
   let W = 1;
@@ -238,6 +243,7 @@ export function buildTieredLookup(
         10000,
       );
       outSmallNonZero = refined.rows;
+      rtpSwaps = refined.swaps;
 
       if (!refined.converged && refined.swaps > 0 && targetSmallNzSumP > 0) {
         const achievedMean =
@@ -304,6 +310,7 @@ export function buildTieredLookup(
               500,
             );
             outSmallNonZero = cvRefined.rows;
+            cvSwaps = cvRefined.swaps;
 
             // Warn if CV refinement spent more RTP budget than half-toleranceRTP
             // (e.g. due to integer rounding in cvSumTolerance vs actual swap deltas).
@@ -351,7 +358,7 @@ export function buildTieredLookup(
     // Sort by payout ascending for the range-scan inside fillStakeRangeGaps.
     outSmallNonZero.sort((a, b) => a.payoutCents - b.payoutCents);
     const otherOutRows: LookupRow[] = [...outCap, ...outLarge];
-    fillStakeRangeGaps(
+    const gapResult = fillStakeRangeGaps(
       outSmallNonZero,
       srcSmallNonZeroAll,
       otherOutRows,
@@ -359,6 +366,8 @@ export function buildTieredLookup(
       betCost,
       warnings,
     );
+    gapFillSwaps = gapResult.swapsApplied;
+    gapsUnfillable = gapResult.unfillable;
   }
 
   const outSmall: LookupRow[] = [...outSmallZero, ...outSmallNonZero];
@@ -442,6 +451,7 @@ export function buildTieredLookup(
     toleranceMet,
     maxRowRtpShare: maxRowShare,
     maxWeightRatio,
+    refinement: { rtpSwaps, cvSwaps, gapFillSwaps, gapsUnfillable },
     warnings,
     stakeReport,
   };

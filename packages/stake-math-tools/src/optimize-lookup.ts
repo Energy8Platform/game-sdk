@@ -464,6 +464,7 @@ export function optimizeLookupTable(
         toleranceMet,
         maxRowRtpShare: maxRowShare,
         maxWeightRatio,
+        refinement: { rtpSwaps: 0, cvSwaps: 0, gapFillSwaps: 0, gapsUnfillable: 0 },
         warnings: iterWarnings,
         stakeReport: successReport,
       };
@@ -511,6 +512,7 @@ export function optimizeLookupTable(
     toleranceMet: best.toleranceMet,
     maxRowRtpShare: best.maxRowShare,
     maxWeightRatio: best.maxWeightRatio,
+    refinement: { rtpSwaps: 0, cvSwaps: 0, gapFillSwaps: 0, gapsUnfillable: 0 },
     warnings,
     stakeReport: bestReport,
   };
