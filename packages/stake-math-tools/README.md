@@ -68,6 +68,14 @@ fillStakeRangeGaps — for each Stake distribution range up to    │
                      the Hit Rate Table" rejection.             │
         │                                                       │
         ▼                                                       │
+diversifyPayouts   — if uniqueEvents < minUniqueEventsRate ×    │
+                     nRowsOut, swap duplicate-payout rows for   │
+                     source rows with new payout values until   │
+                     target unique count reached or RTP budget  │
+                     exhausted. Prevents "Insufficient Unique   │
+                     Events" rejection.                         │
+        │                                                       │
+        ▼                                                       │
 W = n_high·(1 − target_cap_rate) / (n_small · target_cap_rate)  │
         │                                                       │
         ▼                                                       │
@@ -156,6 +164,7 @@ Full types in [`src/types.ts`](./src/types.ts). Internal helpers (`lawsonHansonN
 | `largeTarget` | natural rate | Effective P(cap+large) in output. Override with Stake's per-tier limits if needed. |
 | `betCostCents` | `100` | Bet cost (1 bet = 100 cents). Used for pm = payoutCents / betCostCents. |
 | `ensureRangeCoverage` | `true` | Run a 4th refinement pass that guarantees every Stake distribution range up to actual maxPayout has ≥ 1 output row when source has rows in it. Prevents "Gaps in the Hit Rate Table" rejection. Set to `false` to disable. |
+| `minUniqueEventsRate` | `0.01` | Minimum fraction of `nRowsOut` that must be distinct `payoutCents` values. Stake rejects "Insufficient Unique Events" when too few outcomes exist. 100K output → ≥1K unique. 300K → ≥3K. Set to `0` to disable. When source can't supply enough new payouts, optimizer maximizes under budget and emits a warning. |
 
 ### Output sizing
 
@@ -190,6 +199,13 @@ Full types in [`src/types.ts`](./src/types.ts). Internal helpers (`lawsonHansonN
   },
   maxRowRtpShare: number,              // largest single-row RTP fraction
   maxWeightRatio: number,              // max weight / uniform-prior
+  refinement: {                        // per-pass swap counters
+    rtpSwaps,                          // refineRtpBySwap iterations
+    cvSwaps,                           // refineCvBySwap (Σ-preserving 2-swaps)
+    gapFillSwaps,                      // ensureRangeCoverage swaps
+    diversifySwaps,                    // minUniqueEventsRate swaps
+    gapsUnfillable,                    // ranges source couldn't fill
+  },
   warnings: string[],                  // human-readable issues (gaps, target misses, …)
   stakeReport: {                       // Stake-publish-UI-equivalent metrics
     payoutMultMax,                     // ≡ Stake's "Payout Mult"
@@ -234,7 +250,7 @@ The optimizer **proactively prevents** intermediate gaps via the `ensureRangeCov
 | Within Liability Limits | `topKShare[0]` (top-1) | usually < 0.05 with `largePmThreshold` set |
 | Within Risk Limits | (compute from `baseStd × betCost × maxBet`) | |
 | Hit-Rate Distribution table | `hitRateDistribution` | full match by range |
-| Insufficient Unique Events | `uniqueEvents` | distinct payoutCents in output |
+| Insufficient Unique Events | `uniqueEvents` | distinct payoutCents in output. Auto-driven to `minUniqueEventsRate × nRowsOut` via the diversify pass. |
 | Gaps in Hit Rate Table | `detectHitRateGaps(...)` returns `[]` | tail empties are natural |
 
 ## How tolerance flows
