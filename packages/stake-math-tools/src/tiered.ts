@@ -1376,23 +1376,29 @@ function diversifyPayouts(
   }
 
   let swaps = 0;
+  // sumBudget bounds |running Σ-drift|, NOT a per-swap cost. Each swap can be
+  // +Δ or −Δ depending on whether the new payout is higher or lower than the
+  // old one; the running drift stays in [−sumBudget, +sumBudget]. This lets
+  // up-swaps and down-swaps cancel each other so the pass keeps going long
+  // after a one-directional budget would have exhausted.
   let sumBudget = remainingSumBudget;
+  let runningDrift = 0;
   let exhaustedReason: 'budget' | 'sourceOrAllocation' | null = null;
 
   // Maximize unique payouts — minUniqueEventsRate is a FLOOR, not a cap. Loop
-  // until no further beneficial swap is available (no duplicates left in
-  // outSmallNonZero, no new payouts in source, or RTP-drift budget exhausted).
+  // until no further beneficial swap is available.
   //
-  // Strategy: at each iteration scan dupPayouts and pick the (swap-out,
-  // swap-in) pair with the smallest Σ-drift cost. This stretches the RTP-drift
-  // budget across maximum swaps. O(D × 3) per iteration where D = dupPayouts
-  // size (a few hundreds typically), so the full pass is O(K × D) ≈ K² in the
-  // worst case — fine for K up to ~tens of thousands.
+  // Strategy: at each iteration scan dupPayouts; for each, examine its
+  // sorted-list neighbours (signed delta = newPayout − oldPayout) and pick
+  // the swap that brings |runningDrift + delta| closest to 0 (subject to
+  // staying inside the ±sumBudget band). Up-deltas and down-deltas balance
+  // each other across iterations, so the pass scales with the size of the
+  // dup-pool, not with the per-pass drift budget.
   while (newPayoutsSorted.length > 0 && dupPayouts.size > 0) {
-    // Find the duplicate payout whose nearest-available new payout is closest.
     let pickP = -1;
-    let pickDist = Infinity;
     let pickNewP = -1;
+    let pickDelta = 0;
+    let pickNewAbsDrift = Infinity; // |runningDrift + delta| for the chosen swap
     for (const p of dupPayouts) {
       const rows = payoutToOutRows.get(p);
       if (!rows || rows.size === 0) continue; // stale entry
@@ -1400,15 +1406,25 @@ function diversifyPayouts(
       for (const idx of [ins - 1, ins, ins + 1]) {
         if (idx < 0 || idx >= newPayoutsSorted.length) continue;
         const np = newPayoutsSorted[idx];
-        const d = Math.abs(np - p);
-        if (d < pickDist) {
-          pickDist = d;
+        const delta = np - p;
+        const newDrift = runningDrift + delta;
+        if (Math.abs(newDrift) > sumBudget) continue;
+        const newAbs = Math.abs(newDrift);
+        if (newAbs < pickNewAbsDrift) {
+          pickNewAbsDrift = newAbs;
           pickP = p;
           pickNewP = np;
+          pickDelta = delta;
         }
       }
     }
-    if (pickP < 0) break;
+    if (pickP < 0) {
+      // No swap fits in the budget band. The only way to make progress would
+      // be to first move runningDrift back toward 0, but every candidate we
+      // just rejected already failed; we're stuck.
+      exhaustedReason = 'budget';
+      break;
+    }
 
     const rowsForP = payoutToOutRows.get(pickP)!;
     if (rowsForP.size === 0) {
@@ -1420,14 +1436,6 @@ function diversifyPayouts(
     const swapOutRow = outSmallNonZero[swapOutIdx];
     const swapOutP = pickP;
     const bestNewP = pickNewP;
-    const bestDist = pickDist;
-
-    // Check Σ-drift budget. We picked the globally-cheapest swap; if it
-    // doesn't fit, no remaining swap will either.
-    if (bestDist > sumBudget) {
-      exhaustedReason = 'budget';
-      break;
-    }
 
     const swapInRow = newPayoutsAvailable.get(bestNewP);
     if (!swapInRow) {
@@ -1477,7 +1485,7 @@ function diversifyPayouts(
       newPayoutsSorted.splice(removeAt, 1);
     }
 
-    sumBudget -= bestDist;
+    runningDrift += pickDelta;
     swaps++;
   }
 
