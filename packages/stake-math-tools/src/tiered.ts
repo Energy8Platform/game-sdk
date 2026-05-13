@@ -71,14 +71,42 @@ export function buildTieredLookup(
     else srcSmall.push(r);
   }
 
-  // Target rate
-  const target =
-    params.largeTarget ?? (srcCap.length + srcLarge.length) / filtered.length;
+  // Target rate for cap+large probability mass in OUTPUT.
+  const naturalRate = (srcCap.length + srcLarge.length) / filtered.length;
+  const target = params.largeTarget ?? naturalRate;
 
-  // Phase 4: pick output rows
-  // Include all cap; include all large; fill remaining with small (random sample)
+  // Phase 4: pick output rows.
+  //
+  // When `largeTarget` is explicitly LOWER than the natural source rate, we
+  // MUST subsample cap+large or else Stake's "Max Win Achievability" check
+  // fails: keeping all 100K+ source rows at weight=1 forces W (and thus total
+  // weight) up by the ratio natural/target, making the single max-win row
+  // hide in a pool too large to be reachable at 1 in 20M.
+  //
+  // Subsampling target: keep approximately `target × nRowsOut` cap+large rows
+  // with weight=1, and fill the remaining slots with small-tier rows at
+  // weight ≈ 1. Total weight ≈ nRowsOut → P(max-win) = 1/nRowsOut (easily
+  // satisfies 1 in 20M for typical nRowsOut ≤ 200K).
   let outCap = srcCap;
   let outLarge = srcLarge;
+  const userTargetActive =
+    params.largeTarget !== undefined && params.largeTarget < naturalRate;
+  if (userTargetActive) {
+    // Allocation: try to keep ~target × nRowsOut rare rows. Cap rows get
+    // priority (preserves requireMaxReached); large rows fill the rest.
+    const desiredRareCount = Math.max(1, Math.round(target * params.nRowsOut));
+    const capKeep = Math.min(srcCap.length, desiredRareCount);
+    outCap = [...srcCap].sort((a, b) => b.payoutCents - a.payoutCents).slice(0, capKeep);
+    const largeBudget = Math.max(0, desiredRareCount - outCap.length);
+    if (largeBudget < srcLarge.length) {
+      // Stratified-by-log-payout sample so we preserve distribution shape
+      // across the large tier (instead of just taking top-N by payout).
+      outLarge =
+        largeBudget > 0
+          ? stratifiedSmallSampleNonZero(srcLarge, largeBudget, 50, seed + 31)
+          : [];
+    }
+  }
 
   if (outCap.length > params.nRowsOut) {
     // Too many cap rows — keep highest-payout
