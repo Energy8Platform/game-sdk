@@ -391,15 +391,19 @@ export function buildTieredLookup(
     // Phase 5 computes it, but for the budget we use the same prediction the
     // cv pass did).
     const T_out_predict2 = nHighOut2 + W * (outSmallZero.length + outSmallNonZero.length);
-    // Remaining Σ-drift budget: total budget minus what CV already spent.
-    const totalBudget = W > 0 && T_out_predict2 > 0
-      ? 0.5 * params.toleranceRTP * T_out_predict2 * 100 / W
-      : 0.005 * Math.abs(targetSmallNzSumP);
+    // Diversify budget = full user-supplied RTP-drift envelope minus what RTP+CV
+    // passes already spent. The earlier passes are capped at 0.5 × full_budget
+    // each, but typically use far less — the leftover funds diversify. This
+    // guarantees cumulative drift across all refinement passes stays within
+    // params.toleranceRTP.
+    const fullBudget = W > 0 && T_out_predict2 > 0
+      ? params.toleranceRTP * T_out_predict2 * 100 / W
+      : 0.01 * Math.abs(targetSmallNzSumP);
     const spent =
       cvAchievedSum !== null && targetSmallNzSumP !== 0
         ? Math.abs(cvAchievedSum - targetSmallNzSumP)
         : 0;
-    const sumBudget = Math.max(1, totalBudget - spent);
+    const sumBudget = Math.max(1, fullBudget - spent);
     // Make sure outSmallNonZero is sorted by payout ascending (gap-fill already
     // maintained this invariant when run; if gap-fill was skipped, sort here).
     outSmallNonZero.sort((a, b) => a.payoutCents - b.payoutCents);
@@ -1280,86 +1284,102 @@ function diversifyPayouts(
   warnings: string[],
 ): { swaps: number; achievedUnique: number; reached: boolean } {
   // Build the current set of payouts in output AND in-sample sim ids.
-  const inOutputPayouts = new Map<number, number>(); // payoutCents → count
+  // `payoutToOutRows` indexes positions in outSmallNonZero by their current
+  // payoutCents value; this lets us locate "any row with payout p" in O(1)
+  // and update incrementally on each swap (no array splice / re-scan).
+  const inOutputPayouts = new Map<number, number>(); // payoutCents → count across all tiers
+  const payoutToOutRows = new Map<number, Set<number>>(); // payoutCents → outSmallNonZero indices
   const inSampleSims = new Set<number>();
   for (const r of otherOutRows) {
     inOutputPayouts.set(r.payoutCents, (inOutputPayouts.get(r.payoutCents) ?? 0) + 1);
   }
-  for (const r of outSmallNonZero) {
+  for (let i = 0; i < outSmallNonZero.length; i++) {
+    const r = outSmallNonZero[i];
     inOutputPayouts.set(r.payoutCents, (inOutputPayouts.get(r.payoutCents) ?? 0) + 1);
     inSampleSims.add(r.sim);
+    let s = payoutToOutRows.get(r.payoutCents);
+    if (!s) {
+      s = new Set<number>();
+      payoutToOutRows.set(r.payoutCents, s);
+    }
+    s.add(i);
   }
   let uniqueNow = inOutputPayouts.size;
-  if (uniqueNow >= targetUnique) {
-    return { swaps: 0, achievedUnique: uniqueNow, reached: true };
-  }
 
-  // Index source rows by payoutCents → list of LookupRow (only those NOT in
-  // output payouts and not already used in the sample).
-  const newPayoutsAvailable = new Map<number, LookupRow[]>();
+  // Index source rows by payoutCents → first available LookupRow (only those
+  // NOT already in output and not in sample).
+  const newPayoutsAvailable = new Map<number, LookupRow>();
   for (const r of srcSmallNonZero) {
     if (inOutputPayouts.has(r.payoutCents)) continue;
     if (inSampleSims.has(r.sim)) continue;
-    let arr = newPayoutsAvailable.get(r.payoutCents);
-    if (!arr) {
-      arr = [];
-      newPayoutsAvailable.set(r.payoutCents, arr);
+    if (!newPayoutsAvailable.has(r.payoutCents)) {
+      newPayoutsAvailable.set(r.payoutCents, r);
     }
-    arr.push(r);
   }
-  // Sorted list of new payout values for binary search by magnitude.
+  // Sorted list of new payout values for nearest-neighbor binary search.
   const newPayoutsSorted = Array.from(newPayoutsAvailable.keys()).sort((a, b) => a - b);
 
-  if (newPayoutsSorted.length === 0) {
-    warnings.push(
-      `minUniqueEventsRate target ${targetUnique} unreachable: source has no distinct payout values not already in output (current ${uniqueNow})`,
-    );
-    return { swaps: 0, achievedUnique: uniqueNow, reached: false };
+  // Maintain the set of payoutCents values that have >= 2 rows in outSmallNonZero
+  // (these are the swap-out candidates — losing one of them keeps the payout
+  // represented at least once, so we don't drop a unique-value entirely unless
+  // a copy exists in cap/large/zero tiers).
+  const dupPayouts = new Set<number>();
+  for (const [p, rows] of payoutToOutRows) {
+    // payout is a "safe" swap-out source if the cross-tier count is >= 2
+    // (removing one row still leaves the payout in output somewhere).
+    if ((inOutputPayouts.get(p) ?? 0) >= 2 && rows.size >= 1) dupPayouts.add(p);
   }
 
-  // Find duplicate-payout rows in outSmallNonZero. Any small-non-zero row whose
-  // payout count (across all output tiers) is ≥ 2 is a safe swap-out candidate
-  // — removing one row still leaves the payout represented elsewhere, so the
-  // swap nets +1 unique (modulo whether the swap-in payout is new).
-  const swapOutCandidates: number[] = [];
-  for (let i = 0; i < outSmallNonZero.length; i++) {
-    const p = outSmallNonZero[i].payoutCents;
-    if ((inOutputPayouts.get(p) ?? 0) >= 2) swapOutCandidates.push(i);
+  if (newPayoutsSorted.length === 0) {
+    if (uniqueNow < targetUnique) {
+      warnings.push(
+        `minUniqueEventsRate target ${targetUnique} unreachable: source has no distinct payout values not already in output (current ${uniqueNow})`,
+      );
+    }
+    return { swaps: 0, achievedUnique: uniqueNow, reached: uniqueNow >= targetUnique };
   }
-  if (swapOutCandidates.length === 0) {
-    warnings.push(
-      `minUniqueEventsRate target ${targetUnique} unreachable: every small-non-zero row already has a unique payout (current ${uniqueNow})`,
-    );
-    return { swaps: 0, achievedUnique: uniqueNow, reached: false };
+  if (dupPayouts.size === 0) {
+    if (uniqueNow < targetUnique) {
+      warnings.push(
+        `minUniqueEventsRate target ${targetUnique} unreachable: every small-non-zero row already has a unique payout (current ${uniqueNow})`,
+      );
+    }
+    return { swaps: 0, achievedUnique: uniqueNow, reached: uniqueNow >= targetUnique };
   }
-  // Sort: most-duplicated payout first (cheapest to lose one of).
-  swapOutCandidates.sort((a, b) => {
-    const ca = inOutputPayouts.get(outSmallNonZero[a].payoutCents) ?? 0;
-    const cb = inOutputPayouts.get(outSmallNonZero[b].payoutCents) ?? 0;
-    return cb - ca;
-  });
 
   let swaps = 0;
   let sumBudget = remainingSumBudget;
+  let exhaustedReason: 'budget' | 'sourceOrAllocation' | null = null;
 
-  // Indices in `swapOutCandidates` are positional into outSmallNonZero at the
-  // time of sort; subsequent splices shift later indices. We re-validate the
-  // duplicate condition before each swap, so stale indices that no longer
-  // refer to duplicate rows are skipped harmlessly.
-  for (const initialIdx of swapOutCandidates) {
-    if (uniqueNow >= targetUnique) break;
-    // Re-validate: array may have shifted from earlier splices. Walk to find
-    // the current index of this row's payoutCents value matching the sim, but
-    // simpler: just check the current position — if duplicate condition no
-    // longer holds, skip. Note: after splice ops, `initialIdx` could be out of
-    // range or point at a different row. Clamp and verify.
-    if (initialIdx >= outSmallNonZero.length) continue;
-    const swapOutRow = outSmallNonZero[initialIdx];
+  // Maximize unique payouts — minUniqueEventsRate is a FLOOR, not a cap. Loop
+  // until no further beneficial swap is available (no duplicates left in
+  // outSmallNonZero, no new payouts in source, or RTP-drift budget exhausted).
+  while (newPayoutsSorted.length > 0 && dupPayouts.size > 0) {
+    // Pick any payout that has duplicates. Prefer the one with the highest
+    // cross-tier count (most efficient — keeps the smallest dups for later).
+    let pickP = -1;
+    let pickCount = 1;
+    for (const p of dupPayouts) {
+      const c = inOutputPayouts.get(p) ?? 0;
+      if (c > pickCount) {
+        pickCount = c;
+        pickP = p;
+      }
+    }
+    if (pickP < 0) break;
+    const rowsForP = payoutToOutRows.get(pickP);
+    if (!rowsForP || rowsForP.size === 0) {
+      // All copies of this payout in outSmallNonZero have already been swapped
+      // out; the lingering duplicates are in cap/large/zero tiers and we can't
+      // reduce them here. Remove from dupPayouts and continue.
+      dupPayouts.delete(pickP);
+      continue;
+    }
+    const swapOutIdx = rowsForP.values().next().value as number;
+    const swapOutRow = outSmallNonZero[swapOutIdx];
     const swapOutP = swapOutRow.payoutCents;
-    if ((inOutputPayouts.get(swapOutP) ?? 0) < 2) continue;
 
     // Find the new-payout value closest to swapOutP via binary search.
-    if (newPayoutsSorted.length === 0) break;
     let bestNewP = newPayoutsSorted[0];
     let bestDist = Math.abs(bestNewP - swapOutP);
     const ins = lowerBoundNum(newPayoutsSorted, swapOutP);
@@ -1373,23 +1393,33 @@ function diversifyPayouts(
       }
     }
 
-    // Check Σ-drift budget.
-    if (bestDist > sumBudget) continue;
+    // Check Σ-drift budget. If even the closest swap exceeds the remaining
+    // budget, no future swap will fit either (closer pairs would have been
+    // picked earlier) — stop.
+    if (bestDist > sumBudget) {
+      exhaustedReason = 'budget';
+      break;
+    }
 
-    const candidates = newPayoutsAvailable.get(bestNewP);
-    if (!candidates || candidates.length === 0) continue;
-    const swapInRow = candidates[0];
+    const swapInRow = newPayoutsAvailable.get(bestNewP);
+    if (!swapInRow) {
+      // Defensive: shouldn't happen because newPayoutsSorted mirrors
+      // newPayoutsAvailable. Remove the stale entry and retry.
+      const removeAt = lowerBoundNum(newPayoutsSorted, bestNewP);
+      if (removeAt < newPayoutsSorted.length && newPayoutsSorted[removeAt] === bestNewP) {
+        newPayoutsSorted.splice(removeAt, 1);
+      }
+      continue;
+    }
 
-    // Apply swap: replace outSmallNonZero[initialIdx] with swapInRow, keeping
-    // the array sorted by payoutCents.
-    outSmallNonZero.splice(initialIdx, 1);
-    const insertPos = lowerBoundIdx(outSmallNonZero, swapInRow.payoutCents);
-    outSmallNonZero.splice(insertPos, 0, swapInRow);
-
-    // Update tracking.
+    // Apply swap IN-PLACE — overwrite at the same array slot so existing
+    // indices in payoutToOutRows remain stable.
+    outSmallNonZero[swapOutIdx] = swapInRow;
     inSampleSims.delete(swapOutRow.sim);
     inSampleSims.add(swapInRow.sim);
 
+    // Update payoutToOutRows / dupPayouts for the OLD payout.
+    rowsForP.delete(swapOutIdx);
     const oldCount = inOutputPayouts.get(swapOutP) ?? 0;
     if (oldCount <= 1) {
       inOutputPayouts.delete(swapOutP);
@@ -1397,10 +1427,22 @@ function diversifyPayouts(
     } else {
       inOutputPayouts.set(swapOutP, oldCount - 1);
     }
+    if (rowsForP.size === 0) payoutToOutRows.delete(swapOutP);
+    // After decrement, the cross-tier count may have fallen below 2 — then this
+    // payout is no longer a safe swap-out source.
+    if ((inOutputPayouts.get(swapOutP) ?? 0) < 2) dupPayouts.delete(swapOutP);
+
+    // Update for the NEW payout (now in output at index swapOutIdx).
     inOutputPayouts.set(bestNewP, (inOutputPayouts.get(bestNewP) ?? 0) + 1);
+    let newRowsForP = payoutToOutRows.get(bestNewP);
+    if (!newRowsForP) {
+      newRowsForP = new Set<number>();
+      payoutToOutRows.set(bestNewP, newRowsForP);
+    }
+    newRowsForP.add(swapOutIdx);
     uniqueNow++;
 
-    // bestNewP is now consumed: remove it from the available pool.
+    // bestNewP consumed: remove it from the available pool / sorted list.
     newPayoutsAvailable.delete(bestNewP);
     const removeAt = lowerBoundNum(newPayoutsSorted, bestNewP);
     if (removeAt < newPayoutsSorted.length && newPayoutsSorted[removeAt] === bestNewP) {
@@ -1411,18 +1453,31 @@ function diversifyPayouts(
     swaps++;
   }
 
-  const reached = uniqueNow >= targetUnique;
-  if (!reached) {
-    if (sumBudget <= 0) {
+  if (uniqueNow < targetUnique) {
+    if (exhaustedReason === 'budget') {
       warnings.push(
         `minUniqueEventsRate target ${targetUnique} not reached (achieved ${uniqueNow}): RTP-drift budget exhausted`,
       );
+    } else if (newPayoutsSorted.length === 0) {
+      warnings.push(
+        `minUniqueEventsRate target ${targetUnique} not reached (achieved ${uniqueNow}): source has no more distinct payouts available`,
+      );
+    } else if (dupPayouts.size === 0) {
+      warnings.push(
+        `minUniqueEventsRate target ${targetUnique} not reached (achieved ${uniqueNow}): every output row already has a unique payout in small-non-zero tier`,
+      );
     } else {
       warnings.push(
-        `minUniqueEventsRate target ${targetUnique} not reached (achieved ${uniqueNow}): source-or-allocation limit (${newPayoutsSorted.length} new payouts remained available)`,
+        `minUniqueEventsRate target ${targetUnique} not reached (achieved ${uniqueNow})`,
       );
     }
   }
-  return { swaps, achievedUnique: uniqueNow, reached };
+
+  // Final sort of outSmallNonZero by payoutCents so downstream stages see a
+  // tidy ordering (the in-place overwrites preserved indices but scrambled the
+  // payout order).
+  outSmallNonZero.sort((a, b) => a.payoutCents - b.payoutCents);
+
+  return { swaps, achievedUnique: uniqueNow, reached: uniqueNow >= targetUnique };
 }
 
