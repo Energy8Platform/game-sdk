@@ -633,4 +633,50 @@ describe('integration', () => {
     const gapWarning = result.warnings.find((w) => w.includes('source has no rows'));
     expect(gapWarning).toBeDefined();
   });
+
+  it('22. tiered diversifies to reach minUniqueEventsRate target', () => {
+    // Source has many duplicate payouts (lots of payoutCents=100 wins)
+    const rows: LookupRow[] = [];
+    for (let i = 0; i < 50_000; i++) rows.push({ sim: i, weight: 1, payoutCents: 0 });
+    for (let i = 50_000; i < 60_000; i++) rows.push({ sim: i, weight: 1, payoutCents: 100 }); // all same
+    // But also lots of unique payouts available
+    for (let i = 60_000; i < 70_000; i++) {
+      rows.push({ sim: i, weight: 1, payoutCents: 100 + i }); // each unique
+    }
+
+    const result = optimizeLookupTable(rows, {
+      targetRTP: 0.5, toleranceRTP: 1.0,
+      targetCV: 3, toleranceCV: 100,
+      targetHitRate: 0.3, toleranceHitRate: 0.5,
+      capMaxWin: 100_000,
+      nRowsOut: 1000,
+      requireMaxReached: false,
+      algorithm: 'tiered',
+      minUniqueEventsRate: 0.05,  // 5% = 50 unique payouts required
+    });
+    expect(result.stakeReport.uniqueEvents).toBeGreaterThanOrEqual(50);
+  });
+
+  it('23. tiered warns when minUniqueEventsRate is unreachable', () => {
+    // Source has ONLY 5 unique payout values, but target wants 100
+    const rows: LookupRow[] = [];
+    for (let i = 0; i < 50_000; i++) rows.push({ sim: i, weight: 1, payoutCents: 0 });
+    for (let i = 50_000; i < 55_000; i++) rows.push({ sim: i, weight: 1, payoutCents: 100 });
+    for (let i = 55_000; i < 56_000; i++) rows.push({ sim: i, weight: 1, payoutCents: 200 });
+    for (let i = 56_000; i < 56_500; i++) rows.push({ sim: i, weight: 1, payoutCents: 500 });
+    for (let i = 56_500; i < 56_600; i++) rows.push({ sim: i, weight: 1, payoutCents: 1000 });
+
+    const result = optimizeLookupTable(rows, {
+      targetRTP: 0.05, toleranceRTP: 1.0,
+      targetCV: 3, toleranceCV: 100,
+      targetHitRate: 0.2, toleranceHitRate: 0.5,
+      capMaxWin: 1000,
+      nRowsOut: 10_000,
+      requireMaxReached: false,
+      algorithm: 'tiered',
+      minUniqueEventsRate: 0.05,  // wants 500 unique, source has 5
+    });
+    const warn = result.warnings.find((w) => w.includes('minUniqueEventsRate'));
+    expect(warn).toBeDefined();
+  });
 });

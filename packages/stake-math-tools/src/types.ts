@@ -81,6 +81,16 @@ export interface OptimizeParams {
    *  that range. Prevents Stake's "Gaps in the Hit Rate Table" rejection.
    *  Default true. */
   ensureRangeCoverage?: boolean;
+
+  /** Tier-based only: minimum fraction of nRowsOut that must be distinct payoutCents
+   *  values in the output. Stake Engine rejects "Insufficient Unique Events" when
+   *  too few distinct outcomes exist (same events repeat in a session). Default 0.01
+   *  (1%). For 100K output → 1K unique payouts required. Set to 0 to disable.
+   *
+   *  When the target cannot be reached (source lacks enough distinct payouts, or
+   *  RTP-drift budget exhausts), the optimizer falls back to maximizing unique
+   *  count under the budget and emits a warning. */
+  minUniqueEventsRate?: number;
 }
 
 export interface OptimizeAchieved {
@@ -161,6 +171,8 @@ export interface RefinementStats {
   gapFillSwaps: number;
   /** Stake distribution ranges where source has no rows — gaps that cannot be filled. */
   gapsUnfillable: number;
+  /** Swaps applied to introduce new distinct payoutCents into the output (minUniqueEventsRate). */
+  diversifySwaps: number;
 }
 
 export interface OptimizeResult {

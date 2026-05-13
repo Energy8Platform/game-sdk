@@ -102,6 +102,13 @@ export function buildTieredLookup(
   let cvSwaps = 0;
   let gapFillSwaps = 0;
   let gapsUnfillable = 0;
+  let diversifySwaps = 0;
+  // Diversify-pass budget inputs hoisted from the inner scope. The diversify
+  // pass runs AFTER gap-fill (outside the inner scope), but needs the same
+  // target Σ_smallNz_payout the cv pass used, plus the achievedSum the cv
+  // pass left, to compute the remaining RTP-drift headroom.
+  let targetSmallNzSumP = 0;
+  let cvAchievedSum: number | null = null;
   // Compute W and small-tier subdivision now, so we can do RTP-aware non-zero
   // sampling using the same W used in the output.
   let W = 1;
@@ -202,7 +209,7 @@ export function buildTieredLookup(
     let capSumP = 0;
     for (const r of outCap) capSumP += r.payoutCents;
     for (const r of outLarge) capSumP += r.payoutCents;
-    const targetSmallNzSumP = W > 0 ? (targetSumWP - capSumP) / W : 0;
+    targetSmallNzSumP = W > 0 ? (targetSumWP - capSumP) / W : 0;
     const targetMeanNz = nB > 0 ? targetSmallNzSumP / nB : 0;
 
     if (nB >= srcSmallNonZero.length) {
@@ -311,6 +318,7 @@ export function buildTieredLookup(
             );
             outSmallNonZero = cvRefined.rows;
             cvSwaps = cvRefined.swaps;
+            cvAchievedSum = cvRefined.achievedSum;
 
             // Warn if CV refinement spent more RTP budget than half-toleranceRTP
             // (e.g. due to integer rounding in cvSumTolerance vs actual swap deltas).
@@ -368,6 +376,43 @@ export function buildTieredLookup(
     );
     gapFillSwaps = gapResult.swapsApplied;
     gapsUnfillable = gapResult.unfillable;
+  }
+
+  // Phase 4c: diversification pass — maximize distinct payoutCents in output.
+  // Stake Engine rejects "Insufficient Unique Events" when too few distinct
+  // payouts exist. Swap duplicate-payout rows in outSmallNonZero for source
+  // rows carrying NEW (unseen) payout values, subject to the remaining RTP
+  // drift budget.
+  const minUniqueRate = params.minUniqueEventsRate ?? 0.01;
+  if (minUniqueRate > 0 && outSmallNonZero.length > 0) {
+    const targetUnique = Math.ceil(minUniqueRate * params.nRowsOut);
+    const nHighOut2 = outCap.length + outLarge.length;
+    // Predict T_out and W as the gap-fill pass left them (W is final after
+    // Phase 5 computes it, but for the budget we use the same prediction the
+    // cv pass did).
+    const T_out_predict2 = nHighOut2 + W * (outSmallZero.length + outSmallNonZero.length);
+    // Remaining Σ-drift budget: total budget minus what CV already spent.
+    const totalBudget = W > 0 && T_out_predict2 > 0
+      ? 0.5 * params.toleranceRTP * T_out_predict2 * 100 / W
+      : 0.005 * Math.abs(targetSmallNzSumP);
+    const spent =
+      cvAchievedSum !== null && targetSmallNzSumP !== 0
+        ? Math.abs(cvAchievedSum - targetSmallNzSumP)
+        : 0;
+    const sumBudget = Math.max(1, totalBudget - spent);
+    // Make sure outSmallNonZero is sorted by payout ascending (gap-fill already
+    // maintained this invariant when run; if gap-fill was skipped, sort here).
+    outSmallNonZero.sort((a, b) => a.payoutCents - b.payoutCents);
+    const otherOutRows: LookupRow[] = [...outCap, ...outLarge, ...outSmallZero];
+    const divResult = diversifyPayouts(
+      outSmallNonZero,
+      srcSmallNonZeroAll,
+      otherOutRows,
+      targetUnique,
+      sumBudget,
+      warnings,
+    );
+    diversifySwaps = divResult.swaps;
   }
 
   const outSmall: LookupRow[] = [...outSmallZero, ...outSmallNonZero];
@@ -451,7 +496,7 @@ export function buildTieredLookup(
     toleranceMet,
     maxRowRtpShare: maxRowShare,
     maxWeightRatio,
-    refinement: { rtpSwaps, cvSwaps, gapFillSwaps, gapsUnfillable },
+    refinement: { rtpSwaps, cvSwaps, gapFillSwaps, gapsUnfillable, diversifySwaps },
     warnings,
     stakeReport,
   };
@@ -1200,5 +1245,184 @@ function fillStakeRangeGaps(
   }
 
   return { swapsApplied, unfillable };
+}
+
+/** First index `i` with `arr[i] >= target` (number-array variant). */
+function lowerBoundNum(arr: ReadonlyArray<number>, target: number): number {
+  let lo = 0;
+  let hi = arr.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (arr[mid] < target) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+/**
+ * 5th refinement pass: swap duplicate-payout rows for source rows with NEW
+ * payout values until output has ≥ targetUnique distinct payoutCents. Source
+ * provides candidate rows whose payoutCents is NOT currently in output.
+ *
+ * Each swap is constrained to keep Σ_smallNz drift ≤ remainingSumBudget. Picks
+ * the swap-in payout closest to swap-out's payout to minimize RTP/CV impact.
+ *
+ * Updates `outSmallNonZero` in place. Returns the number of swaps applied,
+ * achieved unique count across (otherOutRows ∪ outSmallNonZero), and whether
+ * the target was reached.
+ */
+function diversifyPayouts(
+  outSmallNonZero: LookupRow[],
+  srcSmallNonZero: ReadonlyArray<LookupRow>,
+  otherOutRows: ReadonlyArray<LookupRow>,
+  targetUnique: number,
+  remainingSumBudget: number,
+  warnings: string[],
+): { swaps: number; achievedUnique: number; reached: boolean } {
+  // Build the current set of payouts in output AND in-sample sim ids.
+  const inOutputPayouts = new Map<number, number>(); // payoutCents → count
+  const inSampleSims = new Set<number>();
+  for (const r of otherOutRows) {
+    inOutputPayouts.set(r.payoutCents, (inOutputPayouts.get(r.payoutCents) ?? 0) + 1);
+  }
+  for (const r of outSmallNonZero) {
+    inOutputPayouts.set(r.payoutCents, (inOutputPayouts.get(r.payoutCents) ?? 0) + 1);
+    inSampleSims.add(r.sim);
+  }
+  let uniqueNow = inOutputPayouts.size;
+  if (uniqueNow >= targetUnique) {
+    return { swaps: 0, achievedUnique: uniqueNow, reached: true };
+  }
+
+  // Index source rows by payoutCents → list of LookupRow (only those NOT in
+  // output payouts and not already used in the sample).
+  const newPayoutsAvailable = new Map<number, LookupRow[]>();
+  for (const r of srcSmallNonZero) {
+    if (inOutputPayouts.has(r.payoutCents)) continue;
+    if (inSampleSims.has(r.sim)) continue;
+    let arr = newPayoutsAvailable.get(r.payoutCents);
+    if (!arr) {
+      arr = [];
+      newPayoutsAvailable.set(r.payoutCents, arr);
+    }
+    arr.push(r);
+  }
+  // Sorted list of new payout values for binary search by magnitude.
+  const newPayoutsSorted = Array.from(newPayoutsAvailable.keys()).sort((a, b) => a - b);
+
+  if (newPayoutsSorted.length === 0) {
+    warnings.push(
+      `minUniqueEventsRate target ${targetUnique} unreachable: source has no distinct payout values not already in output (current ${uniqueNow})`,
+    );
+    return { swaps: 0, achievedUnique: uniqueNow, reached: false };
+  }
+
+  // Find duplicate-payout rows in outSmallNonZero. Any small-non-zero row whose
+  // payout count (across all output tiers) is ≥ 2 is a safe swap-out candidate
+  // — removing one row still leaves the payout represented elsewhere, so the
+  // swap nets +1 unique (modulo whether the swap-in payout is new).
+  const swapOutCandidates: number[] = [];
+  for (let i = 0; i < outSmallNonZero.length; i++) {
+    const p = outSmallNonZero[i].payoutCents;
+    if ((inOutputPayouts.get(p) ?? 0) >= 2) swapOutCandidates.push(i);
+  }
+  if (swapOutCandidates.length === 0) {
+    warnings.push(
+      `minUniqueEventsRate target ${targetUnique} unreachable: every small-non-zero row already has a unique payout (current ${uniqueNow})`,
+    );
+    return { swaps: 0, achievedUnique: uniqueNow, reached: false };
+  }
+  // Sort: most-duplicated payout first (cheapest to lose one of).
+  swapOutCandidates.sort((a, b) => {
+    const ca = inOutputPayouts.get(outSmallNonZero[a].payoutCents) ?? 0;
+    const cb = inOutputPayouts.get(outSmallNonZero[b].payoutCents) ?? 0;
+    return cb - ca;
+  });
+
+  let swaps = 0;
+  let sumBudget = remainingSumBudget;
+
+  // Indices in `swapOutCandidates` are positional into outSmallNonZero at the
+  // time of sort; subsequent splices shift later indices. We re-validate the
+  // duplicate condition before each swap, so stale indices that no longer
+  // refer to duplicate rows are skipped harmlessly.
+  for (const initialIdx of swapOutCandidates) {
+    if (uniqueNow >= targetUnique) break;
+    // Re-validate: array may have shifted from earlier splices. Walk to find
+    // the current index of this row's payoutCents value matching the sim, but
+    // simpler: just check the current position — if duplicate condition no
+    // longer holds, skip. Note: after splice ops, `initialIdx` could be out of
+    // range or point at a different row. Clamp and verify.
+    if (initialIdx >= outSmallNonZero.length) continue;
+    const swapOutRow = outSmallNonZero[initialIdx];
+    const swapOutP = swapOutRow.payoutCents;
+    if ((inOutputPayouts.get(swapOutP) ?? 0) < 2) continue;
+
+    // Find the new-payout value closest to swapOutP via binary search.
+    if (newPayoutsSorted.length === 0) break;
+    let bestNewP = newPayoutsSorted[0];
+    let bestDist = Math.abs(bestNewP - swapOutP);
+    const ins = lowerBoundNum(newPayoutsSorted, swapOutP);
+    for (const idx of [ins - 1, ins, ins + 1]) {
+      if (idx < 0 || idx >= newPayoutsSorted.length) continue;
+      const np = newPayoutsSorted[idx];
+      const d = Math.abs(np - swapOutP);
+      if (d < bestDist) {
+        bestDist = d;
+        bestNewP = np;
+      }
+    }
+
+    // Check Σ-drift budget.
+    if (bestDist > sumBudget) continue;
+
+    const candidates = newPayoutsAvailable.get(bestNewP);
+    if (!candidates || candidates.length === 0) continue;
+    const swapInRow = candidates[0];
+
+    // Apply swap: replace outSmallNonZero[initialIdx] with swapInRow, keeping
+    // the array sorted by payoutCents.
+    outSmallNonZero.splice(initialIdx, 1);
+    const insertPos = lowerBoundIdx(outSmallNonZero, swapInRow.payoutCents);
+    outSmallNonZero.splice(insertPos, 0, swapInRow);
+
+    // Update tracking.
+    inSampleSims.delete(swapOutRow.sim);
+    inSampleSims.add(swapInRow.sim);
+
+    const oldCount = inOutputPayouts.get(swapOutP) ?? 0;
+    if (oldCount <= 1) {
+      inOutputPayouts.delete(swapOutP);
+      uniqueNow--;
+    } else {
+      inOutputPayouts.set(swapOutP, oldCount - 1);
+    }
+    inOutputPayouts.set(bestNewP, (inOutputPayouts.get(bestNewP) ?? 0) + 1);
+    uniqueNow++;
+
+    // bestNewP is now consumed: remove it from the available pool.
+    newPayoutsAvailable.delete(bestNewP);
+    const removeAt = lowerBoundNum(newPayoutsSorted, bestNewP);
+    if (removeAt < newPayoutsSorted.length && newPayoutsSorted[removeAt] === bestNewP) {
+      newPayoutsSorted.splice(removeAt, 1);
+    }
+
+    sumBudget -= bestDist;
+    swaps++;
+  }
+
+  const reached = uniqueNow >= targetUnique;
+  if (!reached) {
+    if (sumBudget <= 0) {
+      warnings.push(
+        `minUniqueEventsRate target ${targetUnique} not reached (achieved ${uniqueNow}): RTP-drift budget exhausted`,
+      );
+    } else {
+      warnings.push(
+        `minUniqueEventsRate target ${targetUnique} not reached (achieved ${uniqueNow}): source-or-allocation limit (${newPayoutsSorted.length} new payouts remained available)`,
+      );
+    }
+  }
+  return { swaps, achievedUnique: uniqueNow, reached };
 }
 
