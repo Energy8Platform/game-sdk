@@ -447,6 +447,33 @@ export function buildTieredLookup(
     diversifySwaps = divResult.swaps;
   }
 
+  // Phase 4d: final RTP polish — after CV / gap-fill / diversify each drifted
+  // Σ_smallNz by up to their per-pass budgets, the cumulative drift can
+  // exceed params.toleranceRTP. Re-run refineRtpBySwap with a generous budget
+  // (full toleranceRTP, not half) to pull Σ back to target. May undo a few
+  // diversify swaps if they pushed too hard in one direction.
+  if (
+    targetSmallNzSumP > 0 &&
+    outSmallNonZero.length > 0 &&
+    srcSmallNonZeroAll.length > 0
+  ) {
+    outSmallNonZero.sort((a, b) => a.payoutCents - b.payoutCents);
+    const T_polish = (outCap.length + outLarge.length) + W * (outSmallZero.length + outSmallNonZero.length);
+    const polishTolerance =
+      W > 0 && T_polish > 0
+        ? Math.max(1, params.toleranceRTP * T_polish * 100 / W)
+        : Math.max(1, 0.001 * targetSmallNzSumP);
+    const polishRefined = refineRtpBySwap(
+      outSmallNonZero,
+      srcSmallNonZeroAll,
+      targetSmallNzSumP,
+      polishTolerance,
+      10000,
+    );
+    outSmallNonZero = polishRefined.rows;
+    rtpSwaps += polishRefined.swaps;
+  }
+
   const outSmall: LookupRow[] = [...outSmallZero, ...outSmallNonZero];
 
   // Phase 5: compute W (recompute to match actual nSmall after sampling)
