@@ -447,11 +447,28 @@ export function buildTieredLookup(
     diversifySwaps = divResult.swaps;
   }
 
-  // Phase 4d: final RTP polish — after CV / gap-fill / diversify each drifted
-  // Σ_smallNz by up to their per-pass budgets, the cumulative drift can
-  // exceed params.toleranceRTP. Re-run refineRtpBySwap with a generous budget
-  // (full toleranceRTP, not half) to pull Σ back to target. May undo a few
-  // diversify swaps if they pushed too hard in one direction.
+  // Phase 4d: final gap-fill then RTP polish.
+  //
+  // Run gap-fill FIRST so any range opened by diversify is restored. Then run
+  // polish with a "protected sims" set covering every small-non-zero row that
+  // is the only occupant of its Stake hit-rate range (counting cap + large +
+  // small-zero too). That way polish can never re-open a range it would
+  // otherwise have to fill in another cycle.
+  if (ensureRangeCoverage && outSmallNonZero.length > 0) {
+    outSmallNonZero.sort((a, b) => a.payoutCents - b.payoutCents);
+    const otherOutRows: LookupRow[] = [...outCap, ...outLarge, ...outSmallZero];
+    const gapResult = fillStakeRangeGaps(
+      outSmallNonZero,
+      srcSmallNonZeroAll,
+      otherOutRows,
+      sourceMetrics.maxPayout,
+      betCost,
+      warnings,
+    );
+    gapFillSwaps += gapResult.swapsApplied;
+    gapsUnfillable = Math.max(gapsUnfillable, gapResult.unfillable);
+  }
+
   if (
     targetSmallNzSumP > 0 &&
     outSmallNonZero.length > 0 &&
@@ -463,35 +480,48 @@ export function buildTieredLookup(
       W > 0 && T_polish > 0
         ? Math.max(1, params.toleranceRTP * T_polish * 100 / W)
         : Math.max(1, 0.001 * targetSmallNzSumP);
+
+    // Range-critical: a small-non-zero row is "protected" iff it's the only
+    // row in its Stake range across the full output (cap + large + small-zero
+    // + other small-non-zero). Removing it would open a gap.
+    const protectedSims = new Set<number>();
+    if (ensureRangeCoverage) {
+      const rangeCount = new Map<number, number>();
+      for (const r of outCap) {
+        const idx = findRange(r.payoutCents, betCost);
+        rangeCount.set(idx, (rangeCount.get(idx) ?? 0) + 1);
+      }
+      for (const r of outLarge) {
+        const idx = findRange(r.payoutCents, betCost);
+        rangeCount.set(idx, (rangeCount.get(idx) ?? 0) + 1);
+      }
+      for (const r of outSmallZero) {
+        const idx = findRange(r.payoutCents, betCost);
+        rangeCount.set(idx, (rangeCount.get(idx) ?? 0) + 1);
+      }
+      const smallNzRangeIdx: number[] = outSmallNonZero.map((r) =>
+        findRange(r.payoutCents, betCost),
+      );
+      for (const idx of smallNzRangeIdx) {
+        rangeCount.set(idx, (rangeCount.get(idx) ?? 0) + 1);
+      }
+      for (let i = 0; i < outSmallNonZero.length; i++) {
+        if ((rangeCount.get(smallNzRangeIdx[i]) ?? 0) <= 1) {
+          protectedSims.add(outSmallNonZero[i].sim);
+        }
+      }
+    }
+
     const polishRefined = refineRtpBySwap(
       outSmallNonZero,
       srcSmallNonZeroAll,
       targetSmallNzSumP,
       polishTolerance,
       10000,
+      protectedSims,
     );
     outSmallNonZero = polishRefined.rows;
     rtpSwaps += polishRefined.swaps;
-  }
-
-  // Phase 4e: re-run gap-fill — polish + diversify can knock out the rows
-  // that the first gap-fill placed (polish swaps purely on Σ, doesn't know
-  // about range coverage). This second pass restores intermediate-range
-  // coverage at the cost of a tiny RTP drift bounded by the same gap-fill
-  // semantics as Phase 4b.
-  if (ensureRangeCoverage && outSmallNonZero.length > 0) {
-    outSmallNonZero.sort((a, b) => a.payoutCents - b.payoutCents);
-    const otherOutRows: LookupRow[] = [...outCap, ...outLarge, ...outSmallZero];
-    const gapResult2 = fillStakeRangeGaps(
-      outSmallNonZero,
-      srcSmallNonZeroAll,
-      otherOutRows,
-      sourceMetrics.maxPayout,
-      betCost,
-      warnings,
-    );
-    gapFillSwaps += gapResult2.swapsApplied;
-    gapsUnfillable = Math.max(gapsUnfillable, gapResult2.unfillable);
   }
 
   const outSmall: LookupRow[] = [...outSmallZero, ...outSmallNonZero];
@@ -727,6 +757,7 @@ function refineRtpBySwap(
   targetSumPayout: number,
   tolerance: number,
   maxSwaps: number,
+  protectedSims?: ReadonlySet<number>,
 ): { rows: LookupRow[]; achievedSum: number; swaps: number; converged: boolean } {
   const inSet = new Set<number>();
   for (const r of sampled) inSet.add(r.sim);
@@ -741,6 +772,9 @@ function refineRtpBySwap(
   }
   sampledArr.sort((a, b) => a.payoutCents - b.payoutCents); // ascending
   outsideArr.sort((a, b) => a.payoutCents - b.payoutCents);
+
+  const isProtected = (sim: number): boolean =>
+    protectedSims !== undefined && protectedSims.has(sim);
 
   // Binary-search-by-payout helpers on a sorted array.
   const lowerBound = (arr: ReadonlyArray<LookupRow>, target: number): number => {
@@ -765,10 +799,15 @@ function refineRtpBySwap(
     }
 
     if (delta > 0) {
-      // Raise Σ: swap lowest sample OUT for highest outside row whose
-      // payout is ≤ (sampleLow + delta), but > sampleLow.
+      // Raise Σ: swap lowest non-protected sample OUT for highest outside row
+      // whose payout is ≤ (sampleLow + delta), but > sampleLow.
       if (sampledArr.length === 0 || outsideArr.length === 0) break;
-      const sampleLow = sampledArr[0];
+      let sampleLowIdx = 0;
+      while (sampleLowIdx < sampledArr.length && isProtected(sampledArr[sampleLowIdx].sim)) {
+        sampleLowIdx++;
+      }
+      if (sampleLowIdx >= sampledArr.length) break; // every row protected
+      const sampleLow = sampledArr[sampleLowIdx];
       const desired = sampleLow.payoutCents + delta;
 
       // Largest outside index with payout ≤ desired AND > sampleLow.payoutCents.
@@ -786,8 +825,7 @@ function refineRtpBySwap(
       const outsideRow = outsideArr[bestIdx];
       const newSum = achievedSum + outsideRow.payoutCents - sampleLow.payoutCents;
 
-      // Apply swap: remove sampleLow (front), insert outsideRow sorted into sampledArr.
-      sampledArr.shift();
+      sampledArr.splice(sampleLowIdx, 1);
       const insertPos = lowerBound(sampledArr, outsideRow.payoutCents);
       sampledArr.splice(insertPos, 0, outsideRow);
       // Remove outsideRow from outsideArr, insert sampleLow sorted.
@@ -799,10 +837,15 @@ function refineRtpBySwap(
       inSet.add(outsideRow.sim);
       achievedSum = newSum;
     } else {
-      // Lower Σ: swap highest sample OUT for lowest outside row whose
-      // payout is ≥ (sampleHigh - |delta|), but < sampleHigh.
+      // Lower Σ: swap highest non-protected sample OUT for lowest outside row
+      // whose payout is ≥ (sampleHigh - |delta|), but < sampleHigh.
       if (sampledArr.length === 0 || outsideArr.length === 0) break;
-      const sampleHigh = sampledArr[sampledArr.length - 1];
+      let sampleHighIdx = sampledArr.length - 1;
+      while (sampleHighIdx >= 0 && isProtected(sampledArr[sampleHighIdx].sim)) {
+        sampleHighIdx--;
+      }
+      if (sampleHighIdx < 0) break; // every row protected
+      const sampleHigh = sampledArr[sampleHighIdx];
       const needLoss = -delta;
       const desired = sampleHigh.payoutCents - needLoss;
 
@@ -814,7 +857,7 @@ function refineRtpBySwap(
       const outsideRow = outsideArr[bestIdx];
       const newSum = achievedSum + outsideRow.payoutCents - sampleHigh.payoutCents;
 
-      sampledArr.pop();
+      sampledArr.splice(sampleHighIdx, 1);
       const insertPos = lowerBound(sampledArr, outsideRow.payoutCents);
       sampledArr.splice(insertPos, 0, outsideRow);
       outsideArr.splice(bestIdx, 1);
