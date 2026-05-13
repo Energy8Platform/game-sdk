@@ -474,6 +474,26 @@ export function buildTieredLookup(
     rtpSwaps += polishRefined.swaps;
   }
 
+  // Phase 4e: re-run gap-fill — polish + diversify can knock out the rows
+  // that the first gap-fill placed (polish swaps purely on Σ, doesn't know
+  // about range coverage). This second pass restores intermediate-range
+  // coverage at the cost of a tiny RTP drift bounded by the same gap-fill
+  // semantics as Phase 4b.
+  if (ensureRangeCoverage && outSmallNonZero.length > 0) {
+    outSmallNonZero.sort((a, b) => a.payoutCents - b.payoutCents);
+    const otherOutRows: LookupRow[] = [...outCap, ...outLarge, ...outSmallZero];
+    const gapResult2 = fillStakeRangeGaps(
+      outSmallNonZero,
+      srcSmallNonZeroAll,
+      otherOutRows,
+      sourceMetrics.maxPayout,
+      betCost,
+      warnings,
+    );
+    gapFillSwaps += gapResult2.swapsApplied;
+    gapsUnfillable = Math.max(gapsUnfillable, gapResult2.unfillable);
+  }
+
   const outSmall: LookupRow[] = [...outSmallZero, ...outSmallNonZero];
 
   // Phase 5: compute W (recompute to match actual nSmall after sampling)
