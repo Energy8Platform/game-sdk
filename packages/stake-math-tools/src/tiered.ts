@@ -1354,48 +1354,48 @@ function diversifyPayouts(
   // Maximize unique payouts — minUniqueEventsRate is a FLOOR, not a cap. Loop
   // until no further beneficial swap is available (no duplicates left in
   // outSmallNonZero, no new payouts in source, or RTP-drift budget exhausted).
+  //
+  // Strategy: at each iteration scan dupPayouts and pick the (swap-out,
+  // swap-in) pair with the smallest Σ-drift cost. This stretches the RTP-drift
+  // budget across maximum swaps. O(D × 3) per iteration where D = dupPayouts
+  // size (a few hundreds typically), so the full pass is O(K × D) ≈ K² in the
+  // worst case — fine for K up to ~tens of thousands.
   while (newPayoutsSorted.length > 0 && dupPayouts.size > 0) {
-    // Pick any payout that has duplicates. Prefer the one with the highest
-    // cross-tier count (most efficient — keeps the smallest dups for later).
+    // Find the duplicate payout whose nearest-available new payout is closest.
     let pickP = -1;
-    let pickCount = 1;
+    let pickDist = Infinity;
+    let pickNewP = -1;
     for (const p of dupPayouts) {
-      const c = inOutputPayouts.get(p) ?? 0;
-      if (c > pickCount) {
-        pickCount = c;
-        pickP = p;
+      const rows = payoutToOutRows.get(p);
+      if (!rows || rows.size === 0) continue; // stale entry
+      const ins = lowerBoundNum(newPayoutsSorted, p);
+      for (const idx of [ins - 1, ins, ins + 1]) {
+        if (idx < 0 || idx >= newPayoutsSorted.length) continue;
+        const np = newPayoutsSorted[idx];
+        const d = Math.abs(np - p);
+        if (d < pickDist) {
+          pickDist = d;
+          pickP = p;
+          pickNewP = np;
+        }
       }
     }
     if (pickP < 0) break;
-    const rowsForP = payoutToOutRows.get(pickP);
-    if (!rowsForP || rowsForP.size === 0) {
-      // All copies of this payout in outSmallNonZero have already been swapped
-      // out; the lingering duplicates are in cap/large/zero tiers and we can't
-      // reduce them here. Remove from dupPayouts and continue.
+
+    const rowsForP = payoutToOutRows.get(pickP)!;
+    if (rowsForP.size === 0) {
+      // Stale entry — clean and retry.
       dupPayouts.delete(pickP);
       continue;
     }
     const swapOutIdx = rowsForP.values().next().value as number;
     const swapOutRow = outSmallNonZero[swapOutIdx];
-    const swapOutP = swapOutRow.payoutCents;
+    const swapOutP = pickP;
+    const bestNewP = pickNewP;
+    const bestDist = pickDist;
 
-    // Find the new-payout value closest to swapOutP via binary search.
-    let bestNewP = newPayoutsSorted[0];
-    let bestDist = Math.abs(bestNewP - swapOutP);
-    const ins = lowerBoundNum(newPayoutsSorted, swapOutP);
-    for (const idx of [ins - 1, ins, ins + 1]) {
-      if (idx < 0 || idx >= newPayoutsSorted.length) continue;
-      const np = newPayoutsSorted[idx];
-      const d = Math.abs(np - swapOutP);
-      if (d < bestDist) {
-        bestDist = d;
-        bestNewP = np;
-      }
-    }
-
-    // Check Σ-drift budget. If even the closest swap exceeds the remaining
-    // budget, no future swap will fit either (closer pairs would have been
-    // picked earlier) — stop.
+    // Check Σ-drift budget. We picked the globally-cheapest swap; if it
+    // doesn't fit, no remaining swap will either.
     if (bestDist > sumBudget) {
       exhaustedReason = 'budget';
       break;
