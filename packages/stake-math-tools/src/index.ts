@@ -13,6 +13,12 @@ export type {
   RefinementStats,
 } from './types.js';
 export { computeStakeReport, detectHitRateGaps } from './stake-report.js';
+export { transformJsonlZst } from './transform-jsonl-zst.js';
+export type {
+  TransformJsonlZstParams,
+  TransformJsonlZstResult,
+  LineMapper,
+} from './transform-jsonl-zst.js';
 
 // Lower-level pieces — exposed so callers can build alternative pipelines or test in isolation.
 export { computeMetrics, isNearMax } from './metrics.js';
