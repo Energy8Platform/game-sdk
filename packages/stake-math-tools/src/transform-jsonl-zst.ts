@@ -30,22 +30,40 @@ export type LineMapper = (
   index: number,
 ) => string | string[] | null | undefined;
 
+export type BinaryLineMapper = (
+  line: Buffer,
+  index: number,
+) => Buffer | string | Array<Buffer | string> | null | undefined;
+
 export interface TransformJsonlZstParams {
   /** Path to a zstd-compressed `.jsonl.zst` file. */
   inputPath: string;
   /** Path where the transformed `.jsonl.zst` will be written (overwritten). */
   outputPath: string;
-  /** Per-line transform. Default = identity passthrough (byte pipe, no
-   *  per-line allocations).
+  /** Per-line transform with the line decoded as a JS string. Default =
+   *  identity passthrough (byte pipe, no per-line allocations).
    *
    *  - Return a `string` to replace the line with that content.
    *  - Return a `string[]` to expand one input line into several output lines.
    *  - Return `null` / `undefined` to drop the line entirely.
    *
-   *  The mapper receives lines as JS strings, so any individual line above
-   *  V8's ~512MB string-length cap will throw when we decode the buffer to
-   *  a string. Identity mode (no mapper) has no such limit. */
+   *  Mutually exclusive with `binaryMapper`. Use `binaryMapper` instead when
+   *  any single line could exceed V8's ~512 MB string-length cap (e.g. bonus
+   *  game books with massive event arrays) — `toString('utf8')` will throw
+   *  `ERR_STRING_TOO_LONG` on lines above that limit. */
   mapper?: LineMapper;
+  /** Per-line transform with the line passed as a raw `Buffer`. Use this
+   *  for any line that may exceed V8's ~512 MB string limit, or when you
+   *  only need to peek at a small prefix (`line.subarray(0, 64).toString()`)
+   *  and want to pass the rest of the bytes through verbatim.
+   *
+   *  Return shape:
+   *    - `Buffer` or `string` — replace the line with that content.
+   *    - array of `Buffer | string` — expand to N output lines.
+   *    - `null` / `undefined` — drop.
+   *
+   *  Mutually exclusive with `mapper`. */
+  binaryMapper?: BinaryLineMapper;
   /** zstd compression level for the output. 1 = fastest, 22 = smallest.
    *  Default 9 — same level the kitsune optimize pipeline uses. */
   zstdLevel?: number;
@@ -66,6 +84,7 @@ export interface TransformJsonlZstResult {
 }
 
 const LF = 0x0a;
+const LF_BUFFER = Buffer.from([LF]);
 
 export async function transformJsonlZst(
   params: TransformJsonlZstParams,
@@ -74,10 +93,18 @@ export async function transformJsonlZst(
     inputPath,
     outputPath,
     mapper,
+    binaryMapper,
     zstdLevel = 9,
     onProgress,
     progressEveryLines = 100_000,
   } = params;
+
+  if (mapper && binaryMapper) {
+    throw new Error(
+      'transformJsonlZst: pass either `mapper` (string) or `binaryMapper` (Buffer), not both',
+    );
+  }
+  const anyMapper = mapper ?? binaryMapper;
 
   const decompress = spawn('zstd', ['-dc', '-q', inputPath], {
     stdio: ['ignore', 'pipe', 'inherit'],
@@ -115,7 +142,7 @@ export async function transformJsonlZst(
   let linesWritten = 0;
 
   try {
-    if (!mapper) {
+    if (!anyMapper) {
       // Identity mode: byte-pipe. Never split into lines, never materialize
       // strings, never accumulate buffers. Constant memory regardless of how
       // long individual lines are.
@@ -126,9 +153,15 @@ export async function transformJsonlZst(
       // Mapper mode: split on LF boundaries by scanning raw bytes. We keep
       // incomplete-line bytes in a small array of Buffers (no concatenation
       // into a single growing JS string), then `Buffer.concat` + `toString`
-      // when the LF is finally seen.
+      // when the LF is finally seen (string mapper) or never (binary mapper).
       let pending: Buffer[] = [];
       let pendingLen = 0;
+
+      const writeMapperResult = async (out: Buffer | string): Promise<void> => {
+        await writeChunk(out);
+        await writeChunk(LF_BUFFER);
+        linesWritten++;
+      };
 
       const flushLine = async (lineBuf: Buffer): Promise<void> => {
         // Strip trailing CR for CRLF tolerance, matching readline behaviour.
@@ -136,20 +169,44 @@ export async function transformJsonlZst(
           lineBuf.length > 0 && lineBuf[lineBuf.length - 1] === 0x0d
             ? lineBuf.subarray(0, lineBuf.length - 1)
             : lineBuf;
-        const lineStr = trimmed.toString('utf8');
-        const result = mapper(lineStr, linesRead);
+
+        let result: string | string[] | Buffer | Array<Buffer | string> | null | undefined;
+        if (binaryMapper) {
+          result = binaryMapper(trimmed, linesRead);
+        } else {
+          // String mapper: decode the line. Lines above V8's ~512 MB string
+          // cap throw ERR_STRING_TOO_LONG here — re-throw with a pointer to
+          // `binaryMapper` so the failure mode is obvious.
+          let lineStr: string;
+          try {
+            lineStr = trimmed.toString('utf8');
+          } catch (err) {
+            if (
+              err instanceof Error &&
+              (err as NodeJS.ErrnoException).code === 'ERR_STRING_TOO_LONG'
+            ) {
+              const wrapped = new Error(
+                `transformJsonlZst: line ${linesRead} is ${trimmed.length} bytes — ` +
+                  `exceeds V8 max JS string length (~512 MB). Use the ` +
+                  '`binaryMapper` option to receive the line as a Buffer.',
+              );
+              (wrapped as { cause?: unknown }).cause = err;
+              throw wrapped;
+            }
+            throw err;
+          }
+          result = mapper!(lineStr, linesRead);
+        }
         linesRead++;
 
         if (result === null || result === undefined) {
           // drop
         } else if (Array.isArray(result)) {
           for (const out of result) {
-            await writeChunk(out + '\n');
-            linesWritten++;
+            await writeMapperResult(out);
           }
         } else {
-          await writeChunk(result + '\n');
-          linesWritten++;
+          await writeMapperResult(result);
         }
 
         if (onProgress && linesRead % progressEveryLines === 0) {

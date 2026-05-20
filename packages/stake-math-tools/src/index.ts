@@ -18,6 +18,7 @@ export type {
   TransformJsonlZstParams,
   TransformJsonlZstResult,
   LineMapper,
+  BinaryLineMapper,
 } from './transform-jsonl-zst.js';
 
 // Lower-level pieces — exposed so callers can build alternative pipelines or test in isolation.

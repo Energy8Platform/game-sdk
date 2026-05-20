@@ -232,6 +232,98 @@ describe('transformJsonlZst', () => {
     expect(out[1]).toBe('{"id":1}');
   });
 
+  it('passes raw Buffer to binaryMapper and lets it emit Buffer or string', async () => {
+    const input = writeJsonlZst('in', [
+      '{"id":0,"v":1}',
+      '{"id":1,"v":2}',
+      '{"id":2,"v":3}',
+    ]);
+    const output = join(workDir, 'out.jsonl.zst');
+
+    const seen: Array<{ isBuffer: boolean; byteLength: number; firstByte: number }> = [];
+    const result = await transformJsonlZst({
+      inputPath: input,
+      outputPath: output,
+      binaryMapper: (lineBuf, i) => {
+        seen.push({
+          isBuffer: Buffer.isBuffer(lineBuf),
+          byteLength: lineBuf.length,
+          firstByte: lineBuf[0],
+        });
+        // Mix Buffer + string returns: even indices stay as Buffer, odd as string.
+        return i % 2 === 0 ? lineBuf : lineBuf.toString('utf8');
+      },
+    });
+
+    expect(result.linesRead).toBe(3);
+    expect(result.linesWritten).toBe(3);
+    expect(seen.every((s) => s.isBuffer)).toBe(true);
+    expect(seen[0].firstByte).toBe('{'.charCodeAt(0));
+    expect(readJsonlZst(output)).toEqual([
+      '{"id":0,"v":1}',
+      '{"id":1,"v":2}',
+      '{"id":2,"v":3}',
+    ]);
+  });
+
+  it('binaryMapper rewrites a multi-megabyte line via prefix-only string conversion', async () => {
+    // Mimic the curate use case: id-prefix lookup + verbatim tail. Build a
+    // ~3 MB line so the test stays fast but the path is identical to what a
+    // 1 GB book line would exercise — only the prefix becomes a string.
+    const bigTail = '"events":[' + '0,'.repeat(1_500_000) + '0]';
+    const bigLine = `{"id":42,${bigTail}}`;
+    const input = writeJsonlZst('in', [
+      `{"id":1,"keep":false}`,
+      bigLine,
+      `{"id":99,"keep":true}`,
+    ]);
+    const output = join(workDir, 'out.jsonl.zst');
+
+    const selected = new Map<number, number>([
+      [42, 0],
+      [99, 1],
+    ]);
+    const idPrefix = /^\{"id":(\d+),/;
+
+    const result = await transformJsonlZst({
+      inputPath: input,
+      outputPath: output,
+      binaryMapper: (lineBuf) => {
+        // Peek only the first 32 bytes — works regardless of full line size.
+        const head = lineBuf.subarray(0, 32).toString('utf8');
+        const m = idPrefix.exec(head);
+        if (!m) return null;
+        const newId = selected.get(Number(m[1]));
+        if (newId === undefined) return null;
+        const prefix = Buffer.from(`{"id":${newId},`);
+        const tail = lineBuf.subarray(m[0].length);
+        return Buffer.concat([prefix, tail], prefix.length + tail.length);
+      },
+    });
+
+    expect(result.linesRead).toBe(3);
+    expect(result.linesWritten).toBe(2);
+    const out = readJsonlZst(output);
+    expect(out.length).toBe(2);
+    // First written line is the rewritten big one (id 42 → 0).
+    expect(out[0].startsWith('{"id":0,"events":[')).toBe(true);
+    expect(out[0].length).toBe(bigLine.length - `{"id":42,`.length + `{"id":0,`.length);
+    expect(out[1]).toBe('{"id":1,"keep":true}');
+  });
+
+  it('rejects when both mapper and binaryMapper are provided', async () => {
+    const input = writeJsonlZst('in', ['{"id":0}']);
+    const output = join(workDir, 'out.jsonl.zst');
+    await expect(
+      transformJsonlZst({
+        inputPath: input,
+        outputPath: output,
+        mapper: (l) => l,
+        binaryMapper: (b) => b,
+      }),
+    ).rejects.toThrow(/either.*mapper.*binaryMapper/);
+  });
+
   it('honors the zstdLevel parameter', async () => {
     const lines = Array.from({ length: 1000 }, (_, i) =>
       JSON.stringify({ id: i, lots: 'of repeating text '.repeat(5) }),
