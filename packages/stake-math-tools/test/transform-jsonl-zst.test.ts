@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -25,13 +25,17 @@ function writeJsonlZst(name: string, lines: string[]): string {
 }
 
 function readJsonlZst(zstPath: string): string[] {
-  const jsonl = execFileSync('zstd', ['-dc', '-q', zstPath]).toString('utf8');
+  // Bump maxBuffer well past the 1 MiB default — some tests round-trip
+  // multi-megabyte payloads.
+  const jsonl = execFileSync('zstd', ['-dc', '-q', zstPath], {
+    maxBuffer: 64 * 1024 * 1024,
+  }).toString('utf8');
   if (jsonl.length === 0) return [];
   return jsonl.endsWith('\n') ? jsonl.slice(0, -1).split('\n') : jsonl.split('\n');
 }
 
 describe('transformJsonlZst', () => {
-  it('round-trips an identity passthrough', async () => {
+  it('round-trips identity as a pure byte passthrough', async () => {
     const lines = [
       '{"id":0,"payoutMultiplier":120}',
       '{"id":1,"payoutMultiplier":0}',
@@ -42,8 +46,11 @@ describe('transformJsonlZst', () => {
 
     const result = await transformJsonlZst({ inputPath: input, outputPath: output });
 
-    expect(result.linesRead).toBe(3);
-    expect(result.linesWritten).toBe(3);
+    // Identity mode does not split into lines, so the counters stay at zero —
+    // by design, to keep the path allocation-free.
+    expect(result.identityPassthrough).toBe(true);
+    expect(result.linesRead).toBe(0);
+    expect(result.linesWritten).toBe(0);
     expect(readJsonlZst(output)).toEqual(lines);
   });
 
@@ -64,6 +71,7 @@ describe('transformJsonlZst', () => {
       },
     });
 
+    expect(result.identityPassthrough).toBe(false);
     expect(result.linesWritten).toBe(3);
     expect(readJsonlZst(output)).toEqual([
       '{"id":0,"v":1,"idx":0,"doubled":2}',
@@ -127,6 +135,26 @@ describe('transformJsonlZst', () => {
     expect(readJsonlZst(output)).toEqual([]);
   });
 
+  it('emits a trailing line that lacks a final newline', async () => {
+    // Build a raw jsonl with no terminating \n, compress it manually so we
+    // exercise the trailing-flush path in the mapper branch.
+    const jsonlPath = join(workDir, 'no-final-lf.jsonl');
+    writeFileSync(jsonlPath, '{"id":0}\n{"id":1}');
+    const input = join(workDir, 'no-final-lf.jsonl.zst');
+    execFileSync('zstd', ['-q', '-f', '-o', input, jsonlPath]);
+    const output = join(workDir, 'out.jsonl.zst');
+
+    const result = await transformJsonlZst({
+      inputPath: input,
+      outputPath: output,
+      mapper: (line) => line,
+    });
+
+    expect(result.linesRead).toBe(2);
+    expect(result.linesWritten).toBe(2);
+    expect(readJsonlZst(output)).toEqual(['{"id":0}', '{"id":1}']);
+  });
+
   it('rejects when the input file does not exist', async () => {
     const output = join(workDir, 'out.jsonl.zst');
     await expect(
@@ -137,7 +165,7 @@ describe('transformJsonlZst', () => {
     ).rejects.toThrow(/zstd -d/);
   });
 
-  it('calls onProgress with the running counts', async () => {
+  it('calls onProgress with the running counts (mapper mode)', async () => {
     const lines = Array.from({ length: 250 }, (_, i) => `{"i":${i}}`);
     const input = writeJsonlZst('in', lines);
     const output = join(workDir, 'out.jsonl.zst');
@@ -146,6 +174,7 @@ describe('transformJsonlZst', () => {
     const result = await transformJsonlZst({
       inputPath: input,
       outputPath: output,
+      mapper: (line) => line,
       progressEveryLines: 100,
       onProgress: (r, w) => calls.push([r, w]),
     });
@@ -159,9 +188,7 @@ describe('transformJsonlZst', () => {
     ]);
   });
 
-  it('supports a large stream without blowing memory', async () => {
-    // 50_000 lines at ~80 bytes each → ~4MB jsonl. Streaming should chew through
-    // this with constant memory; we just sanity-check the count round-trips.
+  it('supports a large stream (identity byte-pipe) without per-line allocations', async () => {
     const N = 50_000;
     const lines = Array.from({ length: N }, (_, i) =>
       JSON.stringify({ id: i, payload: 'x'.repeat(40) }),
@@ -169,22 +196,40 @@ describe('transformJsonlZst', () => {
     const input = writeJsonlZst('in', lines);
     const output = join(workDir, 'out.jsonl.zst');
 
+    const result = await transformJsonlZst({ inputPath: input, outputPath: output });
+
+    expect(result.identityPassthrough).toBe(true);
+    const out = readJsonlZst(output);
+    expect(out.length).toBe(N);
+    expect(out[0]).toBe(lines[0]);
+    expect(out[N - 1]).toBe(lines[N - 1]);
+  });
+
+  it('processes a single line larger than a default stream chunk (128 KiB) via mapper', async () => {
+    // Construct a line of ~512 KiB so it spans many decompressor chunks. This
+    // is the failure mode that `readline += string` hits at scale; the
+    // Buffer-based splitter must concatenate transparently.
+    const bigLine = '{"id":0,"payload":"' + 'x'.repeat(500_000) + '"}';
+    const input = writeJsonlZst('in', [bigLine, '{"id":1}']);
+    const output = join(workDir, 'out.jsonl.zst');
+
+    const sizes: number[] = [];
     const result = await transformJsonlZst({
       inputPath: input,
       outputPath: output,
-      // Keep id, drop payload — mimics a books-rewrite filter step.
       mapper: (line) => {
-        const o = JSON.parse(line);
-        return JSON.stringify({ id: o.id });
+        sizes.push(line.length);
+        return line;
       },
     });
 
-    expect(result.linesRead).toBe(N);
-    expect(result.linesWritten).toBe(N);
+    expect(result.linesRead).toBe(2);
+    expect(result.linesWritten).toBe(2);
+    expect(sizes[0]).toBe(bigLine.length);
+    expect(sizes[1]).toBe('{"id":1}'.length);
     const out = readJsonlZst(output);
-    expect(out.length).toBe(N);
-    expect(out[0]).toBe('{"id":0}');
-    expect(out[N - 1]).toBe(`{"id":${N - 1}}`);
+    expect(out[0].length).toBe(bigLine.length);
+    expect(out[1]).toBe('{"id":1}');
   });
 
   it('honors the zstdLevel parameter', async () => {
@@ -198,11 +243,9 @@ describe('transformJsonlZst', () => {
     await transformJsonlZst({ inputPath: input, outputPath: outFast, zstdLevel: 1 });
     await transformJsonlZst({ inputPath: input, outputPath: outSmall, zstdLevel: 19 });
 
-    // Both decode to identical content.
     expect(readJsonlZst(outFast)).toEqual(readJsonlZst(outSmall));
-    // Higher level produces an at-least-as-small file on repetitive input.
-    const fastSize = readFileSync(outFast).length;
-    const smallSize = readFileSync(outSmall).length;
+    const fastSize = statSync(outFast).size;
+    const smallSize = statSync(outSmall).size;
     expect(smallSize).toBeLessThanOrEqual(fastSize);
   });
 });
