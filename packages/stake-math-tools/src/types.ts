@@ -98,6 +98,13 @@ export interface OptimizeParams {
    *  of the one below it. Default 0.5. */
   shapeDecayRatio?: number;
 
+  /** Tier-based only: auto-pick `shapeDecayRatio` by binary search so the
+   *  achieved CV lands at `targetCV` within `toleranceCV`. Requires
+   *  `shapeDistribution=true` and a `targetCV > 0`. Runs the full pipeline
+   *  up to 6 times (one per bisection step) — expect a 5×-6× wall-clock
+   *  hit on builds where it triggers. Default false. */
+  shapeAutoMatchCV?: boolean;
+
   /** Tier-based only: minimum fraction of nRowsOut that must be distinct payoutCents
    *  values in the output. Stake Engine rejects "Insufficient Unique Events" when
    *  too few distinct outcomes exist (same events repeat in a session). Default 0.01

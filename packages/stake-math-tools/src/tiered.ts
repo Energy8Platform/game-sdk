@@ -34,6 +34,90 @@ export function buildTieredLookup(
   rowsIn: Iterable<LookupRow>,
   params: OptimizeParams,
 ): OptimizeResult {
+  // shapeAutoMatchCV: pick shapeDecayRatio so achieved CV lands at
+  // targetCV within toleranceCV. CV(ratio) is U-shaped — low ratios shrink
+  // the high tier so much that total weight T drops and per-row variance
+  // climbs back up, so naive bisection can get stuck on the wrong side of
+  // the minimum. Use a coarse 5-point grid sweep first, then refine around
+  // the closest-to-target probe. Disables itself on the recursive calls
+  // via `shapeAutoMatchCV: false` so the inner build takes the fast path.
+  if (
+    params.shapeAutoMatchCV &&
+    params.shapeDistribution &&
+    params.targetCV !== undefined &&
+    params.targetCV > 0
+  ) {
+    // Cache the rows so we don't re-iterate a one-shot Iterable across
+    // multiple inner runs.
+    const cachedRows: LookupRow[] = [];
+    for (const r of rowsIn) cachedRows.push(r);
+
+    const targetCV = params.targetCV;
+    const tolerance = Math.max(0.01, params.toleranceCV);
+    const inner = { ...params, shapeAutoMatchCV: false };
+    const trail: Array<{ ratio: number; cv: number; result: OptimizeResult }> = [];
+
+    const run = (r: number): { cv: number; result: OptimizeResult } => {
+      const result = buildTieredLookup(cachedRows, { ...inner, shapeDecayRatio: r });
+      const cv = result.achieved.cv;
+      trail.push({ ratio: r, cv, result });
+      return { cv, result };
+    };
+
+    // Coarse sweep across [0.15, 0.85] — covers a typical operating range
+    // without spending an evaluation at the rail extremes (those tend to
+    // hit max(1, …) clamping and plateau).
+    const coarse = [0.15, 0.3, 0.5, 0.7, 0.85];
+    for (const r of coarse) {
+      const { cv } = run(r);
+      if (Math.abs(cv - targetCV) <= tolerance) {
+        // Lucky early exit.
+        const final = trail[trail.length - 1].result;
+        final.warnings.push(
+          `shapeAutoMatchCV: shapeDecayRatio=${r.toFixed(3)} hit CV=${cv.toFixed(2)} ` +
+            `vs target ${targetCV} on coarse sweep (${trail.length} runs)`,
+        );
+        return final;
+      }
+    }
+
+    // Refine: bisect between the best probe and its closest CV-neighbour on
+    // the side of `targetCV` we need to move toward. If targetCV > best.cv,
+    // we want to RAISE CV — find the probe with CV just above target and
+    // bisect between best.ratio and that probe's ratio. Symmetric for the
+    // other direction. Skip refinement when no useful neighbour exists
+    // (best is on the same side of target as every other probe → we're at
+    // the structural minimum of the U-curve).
+    for (let refine = 0; refine < 2 && trail.length < 8; refine++) {
+      trail.sort((a, b) => Math.abs(a.cv - targetCV) - Math.abs(b.cv - targetCV));
+      const best = trail[0];
+      const needHigherCV = best.cv < targetCV;
+      const neighbour = trail
+        .slice(1)
+        .filter((t) => (needHigherCV ? t.cv > targetCV : t.cv < targetCV))
+        .sort((a, b) => Math.abs(a.cv - targetCV) - Math.abs(b.cv - targetCV))[0];
+      if (!neighbour || Math.abs(neighbour.ratio - best.ratio) < 0.02) break;
+      const mid = (best.ratio + neighbour.ratio) / 2;
+      if (trail.some((t) => Math.abs(t.ratio - mid) < 0.01)) break;
+      const { cv } = run(mid);
+      if (Math.abs(cv - targetCV) <= tolerance) break;
+    }
+
+    // Final pick: the smallest-gap probe overall.
+    trail.sort((a, b) => Math.abs(a.cv - targetCV) - Math.abs(b.cv - targetCV));
+    const winner = trail[0];
+    const finalResult = winner.result;
+    const gap = Math.abs(winner.cv - targetCV);
+    const sortedTrail = trail.slice().sort((a, b) => a.ratio - b.ratio);
+    finalResult.warnings.push(
+      `shapeAutoMatchCV: chose shapeDecayRatio=${winner.ratio.toFixed(3)} ` +
+        `→ CV=${winner.cv.toFixed(2)} vs target ${targetCV} (gap ${gap.toFixed(2)} ` +
+        `after ${trail.length} runs; CV(r) sweep: ` +
+        `${sortedTrail.map((t) => `${t.ratio.toFixed(2)}→${t.cv.toFixed(2)}`).join(', ')})`,
+    );
+    return finalResult;
+  }
+
   const betCost = params.betCostCents ?? DEFAULTS.betCostCents;
   const requireMaxReached = params.requireMaxReached ?? DEFAULTS.requireMaxReached;
   const maxReachedFraction = params.maxReachedFraction ?? DEFAULTS.maxReachedFraction;
