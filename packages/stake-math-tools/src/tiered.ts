@@ -57,7 +57,16 @@ export function buildTieredLookup(
   const maxPm = sourceMetrics.maxPayout / betCost;
   const capPmThreshold = params.capPmThreshold ?? DEFAULTS.capPmFraction * maxPm;
   const capPayoutCents = Math.floor(capPmThreshold * betCost);
-  const largePmThreshold = params.largePmThreshold; // undefined → no large tier
+  // When shapeDistribution is on and the caller didn't carve out a `large`
+  // tier, auto-set one so the log-decay shape has multiple Stake buckets to
+  // span (otherwise it would only see the single cap bucket and the shape
+  // would be a no-op).
+  const shapeDistribution = params.shapeDistribution ?? false;
+  const shapeDecayRatio = params.shapeDecayRatio ?? 0.5;
+  let largePmThreshold = params.largePmThreshold;
+  if (shapeDistribution && largePmThreshold === undefined) {
+    largePmThreshold = Math.max(50, capPmThreshold / 20);
+  }
   const largePayoutCents =
     largePmThreshold !== undefined ? Math.floor(largePmThreshold * betCost) : undefined;
 
@@ -87,11 +96,27 @@ export function buildTieredLookup(
   // with weight=1, and fill the remaining slots with small-tier rows at
   // weight ≈ 1. Total weight ≈ nRowsOut → P(max-win) = 1/nRowsOut (easily
   // satisfies 1 in 20M for typical nRowsOut ≤ 200K).
-  let outCap = srcCap;
-  let outLarge = srcLarge;
+  let outCap: LookupRow[] = srcCap.slice();
+  let outLarge: LookupRow[] = srcLarge.slice();
   const userTargetActive =
     params.largeTarget !== undefined && params.largeTarget < naturalRate;
-  if (userTargetActive) {
+  if (shapeDistribution) {
+    // Log-decay sample across Stake hit-rate buckets. Spreads cap+large
+    // rows so each higher bucket has roughly `ratio × prev` rows — fixes
+    // the typical `…18 → 1 → 1 → 1 → 4` cliff/spike at the tail.
+    const targetTotalCount = userTargetActive
+      ? Math.max(1, Math.round(target * params.nRowsOut))
+      : undefined;
+    ({ outCap, outLarge } = bucketDecaySampleHighTier(
+      srcCap,
+      srcLarge,
+      betCost,
+      capPayoutCents,
+      shapeDecayRatio,
+      targetTotalCount,
+      seed + 31,
+    ));
+  } else if (userTargetActive) {
     // Allocation: try to keep ~target × nRowsOut rare rows. Cap rows get
     // priority (preserves requireMaxReached); large rows fill the rest.
     const desiredRareCount = Math.max(1, Math.round(target * params.nRowsOut));
@@ -1237,6 +1262,91 @@ function uniformReservoirSample(
   const weights = new Array(indices.length).fill(1);
   const sampled = weightedReservoirSample(indices, weights, k, rng);
   return sampled.map((idx) => rows[idx]);
+}
+
+/**
+ * High-tier (cap + large) sampling that targets a smooth log-decay shape
+ * across Stake hit-rate buckets. Used when `shapeDistribution=true`.
+ *
+ * Algorithm:
+ *   1. Bucket all high-tier source rows by Stake hit-rate range.
+ *   2. Treat the lowest non-empty bucket as the anchor; target counts for
+ *      higher buckets follow `anchor × ratio^k`.
+ *   3. If a global total target is provided, rescale the base so the row
+ *      counts sum to it (subsample mode). Otherwise just use the anchor's
+ *      source count as base.
+ *   4. Each bucket samples its target_count rows stratified-by-log-payout
+ *      from within the bucket — preserves shape variety inside the range.
+ *   5. Cap-vs-large classification of each picked row mirrors the source
+ *      classification (payoutCents ≥ capPayoutCents → cap, else large).
+ *
+ * Guarantees at least 1 row per bucket that has source candidates, so the
+ * top bucket (max-reach) stays populated. If a bucket's source count is
+ * below the decay target, all source rows in that bucket are kept.
+ */
+function bucketDecaySampleHighTier(
+  srcCap: ReadonlyArray<LookupRow>,
+  srcLarge: ReadonlyArray<LookupRow>,
+  betCost: number,
+  capPayoutCents: number,
+  decayRatio: number,
+  /** When defined, scale base so Σ target counts ≈ this. */
+  targetTotalCount: number | undefined,
+  seed: number,
+): { outCap: LookupRow[]; outLarge: LookupRow[] } {
+  const highSource = [...srcCap, ...srcLarge];
+  if (highSource.length === 0) {
+    return { outCap: [], outLarge: [] };
+  }
+
+  const byBucket = new Map<number, LookupRow[]>();
+  for (const r of highSource) {
+    const idx = findRange(r.payoutCents, betCost);
+    let list = byBucket.get(idx);
+    if (!list) {
+      list = [];
+      byBucket.set(idx, list);
+    }
+    list.push(r);
+  }
+
+  const bucketIdxs = [...byBucket.keys()].sort((a, b) => a - b);
+  const lowestIdx = bucketIdxs[0];
+
+  const weights: number[] = bucketIdxs.map((bIdx) =>
+    Math.pow(decayRatio, bIdx - lowestIdx),
+  );
+  const weightSum = weights.reduce((a, b) => a + b, 0);
+
+  let base: number;
+  if (targetTotalCount !== undefined && targetTotalCount > 0) {
+    base = targetTotalCount / weightSum;
+  } else {
+    base = byBucket.get(lowestIdx)!.length;
+  }
+
+  const outCap: LookupRow[] = [];
+  const outLarge: LookupRow[] = [];
+
+  for (let i = 0; i < bucketIdxs.length; i++) {
+    const bIdx = bucketIdxs[i];
+    const candidates = byBucket.get(bIdx)!;
+    const want = Math.max(1, Math.min(candidates.length, Math.round(base * weights[i])));
+
+    const sampled =
+      want >= candidates.length
+        ? [...candidates]
+        : stratifiedSmallSampleNonZero(candidates, want, 10, seed + i * 31);
+
+    for (const r of sampled) {
+      if (r.payoutCents >= capPayoutCents) {
+        outCap.push(r);
+      } else {
+        outLarge.push(r);
+      }
+    }
+  }
+  return { outCap, outLarge };
 }
 
 /**

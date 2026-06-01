@@ -82,6 +82,22 @@ export interface OptimizeParams {
    *  Default true. */
   ensureRangeCoverage?: boolean;
 
+  /** Tier-based only: reshape the high-tier sampling so the per-bucket row
+   *  counts follow a log-decay curve across Stake hit-rate ranges — each
+   *  bucket above the lowest one in the high tier targets `ratio × prev`
+   *  rows. Turns the typical sparse tail of `…18 → 1 → 1 → 1 → 4` into
+   *  a smooth `…18 → 9 → 4 → 2 → 1` instead.
+   *
+   *  When true and `largePmThreshold` is unset, auto-sets it to
+   *  `max(50, capPmThreshold / 20)` so the decay covers multiple Stake
+   *  buckets, not just the single cap bucket. Default false. */
+  shapeDistribution?: boolean;
+
+  /** Tier-based only: ratio between adjacent Stake-bucket row counts when
+   *  `shapeDistribution=true`. 0.5 = each higher bucket has half the rows
+   *  of the one below it. Default 0.5. */
+  shapeDecayRatio?: number;
+
   /** Tier-based only: minimum fraction of nRowsOut that must be distinct payoutCents
    *  values in the output. Stake Engine rejects "Insufficient Unique Events" when
    *  too few distinct outcomes exist (same events repeat in a session). Default 0.01
